@@ -1,0 +1,12 @@
+# Python / Virtual Environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Environment Variables
+.env
+
+# Temporary files & Output
+temp_*.pdf
+temp_*.png
+extracted_data.xlsx
