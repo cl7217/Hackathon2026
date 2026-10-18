@@ -10,3 +10,4 @@ __pycache__/
 temp_*.pdf
 temp_*.png
 extracted_data.xlsx
+data/

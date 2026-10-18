@@ -47,9 +47,11 @@ function formatFileSize(bytes) {
 function getFieldValue(source) {
   if (source === true) return 'כן'
   if (source === false) return 'לא'
+  if (Array.isArray(source)) return source.map(String).join(', ')
   if (typeof source === 'string' || typeof source === 'number') return String(source)
   if (source && typeof source === 'object') {
     const value = source.value ?? source.text ?? source.extracted_value
+    if (Array.isArray(value)) return value.map(String).join(', ')
     return typeof value === 'string' || typeof value === 'number' ? String(value) : ''
   }
   return ''
@@ -83,6 +85,7 @@ function normalizeResults(payload) {
       fieldObject.needs_review === true ||
       fieldObject.uncertain === true ||
       fieldObject.low_confidence === true ||
+      (fieldObject.state !== undefined && fieldObject.state !== 'green') ||
       reviewSet.has(sourceKey) ||
       reviewSet.has(field.key) ||
       (Number.isFinite(confidence) && confidence < (confidence > 1 ? CONFIDENCE_THRESHOLD * 100 : CONFIDENCE_THRESHOLD))
@@ -141,6 +144,7 @@ function App() {
         values: {},
         uncertain: {},
         reviewed: {},
+        corrected: {},
         approved: false,
         status: 'pending',
         error: '',
@@ -165,6 +169,14 @@ function App() {
   }
 
   function removeDocument(id) {
+    const document = documents.find((item) => item.id === id)
+    if (document?.documentId && document.status === 'complete') {
+      fetch(`${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}?page=${document.page || 1}`, {
+        method: 'DELETE',
+      }).then((response) => {
+        if (!response.ok) setUploadError('לא ניתן למחוק את הטופס מהשרת. נסו שוב.')
+      }).catch(() => setUploadError('לא ניתן להתחבר לשירות החילוץ כדי למחוק את הטופס.'))
+    }
     setDocuments((current) => current.filter((document) => document.id !== id))
     if (previewId === id) closePreview()
   }
@@ -176,47 +188,104 @@ function App() {
 
     setIsProcessing(true)
     setUploadError('')
-    for (const document of queue) {
-      setDocuments((current) =>
-        current.map((item) => item.id === document.id ? { ...item, status: 'processing', error: '' } : item),
-      )
+    setDocuments((current) =>
+      current.map((item) =>
+        queue.some((queued) => queued.id === item.id)
+          ? { ...item, status: 'processing', error: '' }
+          : item,
+      ),
+    )
 
-      try {
-        const body = new FormData()
-        body.append('file', document.file)
-        const response = await fetch(`${API_BASE_URL}${EXTRACT_ENDPOINT}`, { method: 'POST', body })
-
-        if (!response.ok) {
-          let detail = ''
-          try {
-            const errorBody = await response.json()
-            detail = errorBody.detail || errorBody.message || ''
-          } catch {
-            // The service may return a non-JSON error response.
-          }
-          throw new Error(detail || `השרת החזיר שגיאה (${response.status}). נסו שוב.`)
+    try {
+      const body = new FormData()
+      queue.forEach((document) => body.append('files', document.file))
+      const response = await fetch(`${API_BASE_URL}/api/batches`, { method: 'POST', body })
+      if (!response.ok) {
+        let detail = ''
+        try {
+          const errorBody = await response.json()
+          detail = errorBody.detail || errorBody.message || ''
+        } catch {
+          // The service may return a non-JSON error response.
         }
-
-        const result = normalizeResults(await response.json())
-        setDocuments((current) =>
-          current.map((item) =>
-            item.id === document.id
-              ? { ...item, ...result, reviewed: {}, approved: false, status: 'complete', error: '' }
-              : item,
-          ),
-        )
-      } catch (requestError) {
-        const message = requestError instanceof TypeError
-          ? 'לא ניתן להתחבר לשירות החילוץ. בדקו את החיבור ונסו שוב.'
-          : requestError.message || 'החילוץ נכשל. נסו שוב בעוד רגע.'
-        setDocuments((current) =>
-          current.map((item) =>
-            item.id === document.id ? { ...item, status: 'error', error: message } : item,
-          ),
-        )
+        throw new Error(detail || `השרת החזיר שגיאה (${response.status}). נסו שוב.`)
       }
-    }
+      const { batch_id: batchId } = await response.json()
+      let batch
+      do {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000))
+        const statusResponse = await fetch(`${API_BASE_URL}/api/batches/${encodeURIComponent(batchId)}`)
+        if (!statusResponse.ok) throw new Error('לא ניתן לקבל את מצב האצווה מהשרת.')
+        batch = await statusResponse.json()
+      } while (batch.status === 'queued' || batch.status === 'processing')
+
+      const documentsByName = new Map()
+      for (const result of batch.documents || []) {
+        const matches = documentsByName.get(result.filename) || []
+        matches.push(result)
+        documentsByName.set(result.filename, matches)
+      }
+      const replacements = new Map()
+      for (const document of queue) {
+        const matches = documentsByName.get(document.file.name) || []
+        const result = matches.shift()
+        if (!result) {
+          replacements.set(document.id, [{
+            ...document,
+            status: 'error',
+            error: 'הקובץ לא הופיע בתוצאות העיבוד.',
+          }])
+          continue
+        }
+        if (result.status !== 'complete') {
+          replacements.set(document.id, [{
+            ...document,
+            documentId: result.id,
+            status: 'error',
+            error: result.error || 'החילוץ נכשל. ניתן לנסות שוב.',
+          }])
+          continue
+        }
+        const forms = (result.forms || []).map((form, index) => {
+          const page = Number(form.page) || index + 1
+          const fieldData = Object.fromEntries(
+            (form.fields || []).map((field) => [field.name, field]),
+          )
+          return {
+            ...document,
+            id: page === 1 ? document.id : `${document.id}-page-${page}`,
+            documentId: result.id,
+            page,
+            ...normalizeResults({ data: fieldData }),
+            reviewed: {},
+            corrected: {},
+            approved: false,
+            status: 'complete',
+            error: '',
+          }
+        })
+        replacements.set(document.id, forms)
+      }
+      setDocuments((current) =>
+        current.flatMap((item) => replacements.get(item.id) || [item]),
+      )
+      if (batch.status === 'failed' || batch.status === 'partial') {
+        setUploadError('חלק מהקבצים לא עובדו בהצלחה. פרטי השגיאה מוצגים בשורות המתאימות.')
+      }
+    } catch (requestError) {
+      const message = requestError instanceof TypeError
+        ? 'לא ניתן להתחבר לשירות החילוץ. בדקו את החיבור ונסו שוב.'
+        : requestError.message || 'החילוץ נכשל. נסו שוב בעוד רגע.'
+      setDocuments((current) =>
+        current.map((item) =>
+          queue.some((queued) => queued.id === item.id)
+            ? { ...item, status: 'error', error: message }
+            : item,
+        ),
+      )
+    } finally {
     setIsProcessing(false)
+    }
   }
 
   function openPreview(document) {
@@ -237,6 +306,7 @@ function App() {
               ...item,
               values: { ...item.values, [field.key]: value },
               reviewed: { ...item.reviewed, [field.key]: true },
+              corrected: { ...item.corrected, [field.key]: true },
               approved: false,
             }
           : item,
@@ -244,22 +314,59 @@ function App() {
     )
   }
 
-  function markFieldReviewed(document, field) {
-    setDocuments((current) =>
-      current.map((item) =>
-        item.id === document.id
-          ? { ...item, reviewed: { ...item.reviewed, [field.key]: true }, approved: false }
-          : item,
-      ),
-    )
+  async function markFieldReviewed(document, field) {
+    try {
+      if (document.documentId) {
+        const fieldName = encodeURIComponent(field.aliases[0])
+        const response = await fetch(
+          `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/fields/${fieldName}/review?page=${document.page || 1}`,
+          { method: 'POST' },
+        )
+        if (!response.ok) throw new Error('לא ניתן לשמור את אישור השדה בשרת.')
+      }
+      setDocuments((current) =>
+        current.map((item) =>
+          item.id === document.id
+            ? { ...item, reviewed: { ...item.reviewed, [field.key]: true }, approved: false }
+            : item,
+        ),
+      )
+    } catch (requestError) {
+      setUploadError(requestError.message || 'לא ניתן לשמור את בדיקת השדה.')
+    }
   }
 
-  function approveDocument(document) {
+  async function approveDocument(document) {
     const hasUnreviewedFields = RESULT_FIELDS.some(
       (field) => document.uncertain[field.key] && !document.reviewed[field.key],
     )
-    if (hasUnreviewedFields || document.status !== 'complete') return
-    updateDocument(document.id, { approved: true })
+    if (hasUnreviewedFields || document.status !== 'complete') return false
+    try {
+      if (document.documentId) {
+        for (const field of RESULT_FIELDS) {
+          if (!document.corrected[field.key]) continue
+          const response = await fetch(
+            `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/fields/${encodeURIComponent(field.aliases[0])}?page=${document.page || 1}`,
+            {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ value: document.values[field.key] || null }),
+            },
+          )
+          if (!response.ok) throw new Error('לא ניתן לשמור את תיקוני הטופס.')
+        }
+        const response = await fetch(
+          `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/approve?page=${document.page || 1}`,
+          { method: 'POST' },
+        )
+        if (!response.ok) throw new Error('השרת דחה את אישור הטופס. בדקו שכל השדות סומנו.')
+      }
+      updateDocument(document.id, { approved: true })
+      return true
+    } catch (requestError) {
+      setUploadError(requestError.message || 'לא ניתן לאשר את הטופס.')
+      return false
+    }
   }
 
   async function exportApprovedDocuments() {
@@ -269,16 +376,30 @@ function App() {
     setIsExporting(true)
     setUploadError('')
     try {
-      const XLSX = await import('@e965/xlsx')
-      const rows = approved.map((document) => ({
-        'שם הקובץ': document.file.name,
-        ...Object.fromEntries(RESULT_FIELDS.map((field) => [field.label, document.values[field.key] || ''])),
-      }))
-      const worksheet = XLSX.utils.json_to_sheet(rows)
-      worksheet['!cols'] = [{ wch: 32 }, ...RESULT_FIELDS.map(() => ({ wch: 20 }))]
-      const workbook = XLSX.utils.book_new()
-      XLSX.utils.book_append_sheet(workbook, worksheet, 'טפסים מאושרים')
-      XLSX.writeFile(workbook, 'טפסים-מאושרים.xlsx')
+      const documentIds = [...new Set(approved.map((document) => document.documentId).filter(Boolean))]
+      if (documentIds.length === approved.length) {
+        const query = new URLSearchParams()
+        documentIds.forEach((documentId) => query.append('document_ids', documentId))
+        const response = await fetch(`${API_BASE_URL}/api/export.xlsx?${query}`)
+        if (!response.ok) throw new Error('ייצוא הטפסים שאושרו מהשרת נכשל.')
+        const downloadUrl = URL.createObjectURL(await response.blob())
+        const link = window.document.createElement('a')
+        link.href = downloadUrl
+        link.download = 'טפסים-מאושרים.xlsx'
+        link.click()
+        URL.revokeObjectURL(downloadUrl)
+      } else {
+        const XLSX = await import('@e965/xlsx')
+        const rows = approved.map((document) => ({
+          'שם הקובץ': document.file.name,
+          ...Object.fromEntries(RESULT_FIELDS.map((field) => [field.label, document.values[field.key] || ''])),
+        }))
+        const worksheet = XLSX.utils.json_to_sheet(rows)
+        worksheet['!cols'] = [{ wch: 32 }, ...RESULT_FIELDS.map(() => ({ wch: 20 }))]
+        const workbook = XLSX.utils.book_new()
+        XLSX.utils.book_append_sheet(workbook, worksheet, 'טפסים מאושרים')
+        XLSX.writeFile(workbook, 'טפסים-מאושרים.xlsx')
+      }
     } catch (exportError) {
       setUploadError(`ייצוא לאקסל נכשל: ${exportError.message || 'נסו שוב.'}`)
     } finally {
@@ -465,7 +586,9 @@ function App() {
                               : <FileImage size={16} className="mt-0.5 shrink-0 text-[#4d94bc]" />}
                             <div className="min-w-0">
                               <span className="block text-xs text-slate-400">טופס {index + 1}</span>
-                              <span className="mt-1 block truncate font-semibold text-slate-700" title={document.file.name}>{document.file.name}</span>
+                              <span className="mt-1 block truncate font-semibold text-slate-700" title={document.file.name}>
+                                {document.file.name}{document.page ? ` · עמוד ${document.page}` : ''}
+                              </span>
                             </div>
                           </div>
                         </td>
@@ -567,7 +690,9 @@ function App() {
             <header className="flex items-center justify-between gap-3 border-b border-slate-100 px-5 py-4">
               <div className="min-w-0">
                 <h2 id="review-title" className="text-base font-bold text-slate-800">בדיקה ועריכה ידנית</h2>
-                <p className="mt-1 truncate text-xs text-slate-400">{previewDocument.file.name}</p>
+                <p className="mt-1 truncate text-xs text-slate-400">
+                  {previewDocument.file.name}{previewDocument.page ? ` · עמוד ${previewDocument.page}` : ''}
+                </p>
               </div>
               <button type="button" onClick={closePreview} aria-label="סגירה" className="rounded-lg p-2 text-slate-400 hover:bg-slate-100">
                 <X size={20} />
@@ -577,7 +702,11 @@ function App() {
             <div className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto lg:grid-cols-2 lg:overflow-hidden">
               <div className="flex min-h-[320px] items-center justify-center bg-slate-100 p-3 lg:min-h-0">
                 {previewDocument.file.type === 'application/pdf' ? (
-                  <iframe title={`תצוגת ${previewDocument.file.name}`} src={previewUrl} className="h-[55vh] w-full rounded-lg bg-white lg:h-full" />
+                  <iframe
+                    title={`תצוגת ${previewDocument.file.name}`}
+                    src={`${previewUrl}#page=${previewDocument.page || 1}`}
+                    className="h-[55vh] w-full rounded-lg bg-white lg:h-full"
+                  />
                 ) : (
                   <img src={previewUrl} alt={`תצוגת ${previewDocument.file.name}`} className="max-h-[55vh] max-w-full rounded-lg object-contain lg:max-h-full" />
                 )}
@@ -603,6 +732,22 @@ function App() {
                             type="text"
                             value={previewDocument.values[field.key] || ''}
                             onChange={(event) => editField(previewDocument, field, event.target.value)}
+                            onBlur={async () => {
+                              if (!previewDocument.documentId || !previewDocument.corrected[field.key]) return
+                              try {
+                                const response = await fetch(
+                                  `${API_BASE_URL}/api/documents/${encodeURIComponent(previewDocument.documentId)}/fields/${encodeURIComponent(field.aliases[0])}?page=${previewDocument.page || 1}`,
+                                  {
+                                    method: 'PATCH',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ value: previewDocument.values[field.key] || null }),
+                                  },
+                                )
+                                if (!response.ok) throw new Error('לא ניתן לשמור את תיקוני השדה.')
+                              } catch (requestError) {
+                                setUploadError(requestError.message || 'לא ניתן לשמור את תיקוני השדה.')
+                              }
+                            }}
                             placeholder="לא זוהה — ניתן להזין ידנית"
                             className={`min-w-0 flex-1 rounded-lg border px-3 py-2.5 text-sm text-slate-800 outline-none transition focus:ring-2 ${
                               needsReview
@@ -633,9 +778,9 @@ function App() {
                   <button
                     type="button"
                     disabled={RESULT_FIELDS.some((field) => previewDocument.uncertain[field.key] && !previewDocument.reviewed[field.key])}
-                    onClick={() => {
-                      approveDocument(previewDocument)
-                      closePreview()
+                    onClick={async () => {
+                      const approved = await approveDocument(previewDocument)
+                      if (approved) closePreview()
                     }}
                     className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-300"
                   >
