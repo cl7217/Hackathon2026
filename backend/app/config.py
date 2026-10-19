@@ -33,7 +33,7 @@ TESSERACT_COMMAND = os.getenv("TESSERACT_COMMAND", "tesseract")
 OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "heb+eng")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-SUPABASE_ENABLED = bool(SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY)
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
 
 SENDER_ALLOWLIST = (
     "כללית",
@@ -58,4 +58,10 @@ SENDER_ALLOWLIST = (
     "פוריה",
     "לניאדו",
     "מעייני הישועה",
+)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_TIMEOUT_SECONDS = int(
+    os.getenv("GEMINI_TIMEOUT_SECONDS", "90")
 )

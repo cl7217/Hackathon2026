@@ -15,6 +15,7 @@ _PAGE_SIZE = 1000
 _FILTER_CHUNK_SIZE = 200
 
 
+
 def initialize_database() -> None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError(
@@ -22,19 +23,24 @@ def initialize_database() -> None:
         )
     if not SUPABASE_URL.startswith(("https://", "http://")):
         raise RuntimeError("SUPABASE_URL must be an HTTP(S) URL.")
-    for table in (
-        "extraction_batches",
-        "extraction_documents",
-        "extraction_forms",
-        "extraction_fields",
-    ):
+
+    tables = {
+        "extraction_batches": "id",
+        "extraction_documents": "id",
+        "extraction_forms": "id",
+        "extraction_fields": "form_id",
+    }
+
+    for table, column in tables.items():
         result = _request(
             "GET",
             table,
-            params={"select": "id", "limit": "1"},
+            params={"select": column, "limit": "1"},
         )
         if not isinstance(result, list):
-            raise RuntimeError(f"Supabase returned an invalid {table} readiness response.")
+            raise RuntimeError(
+                f"Supabase returned an invalid {table} readiness response."
+            )
 
 
 def _request(
@@ -67,10 +73,19 @@ def _request(
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             response_body = response.read()
+    
     except urllib.error.HTTPError as error:
-        error.read()
-        logger.error("Supabase request failed with HTTP %s.", error.code)
-        raise RuntimeError(f"Supabase request failed with HTTP {error.code}.") from error
+        body = error.read().decode("utf-8", errors="replace")
+        logger.error(
+            "Supabase request failed: HTTP %s. URL: %s. Response: %s",
+            error.code,
+            request.full_url,
+            body,
+        )
+        raise RuntimeError(
+            f"Supabase request failed with HTTP {error.code}: {body}"
+        ) from error
+
     except urllib.error.URLError as error:
         logger.error("Supabase request could not reach the configured service: %s", error)
         raise RuntimeError("Could not connect to the configured Supabase service.") from error
@@ -168,7 +183,7 @@ def create_batch(status: str = "queued") -> str:
 
 def update_batch_status(batch_id: str, status: str) -> None:
     stage = (
-        "complete"
+        "review"
         if status in {"complete", "partial", "failed"}
         else "ingestion"
     )
@@ -181,7 +196,7 @@ def update_batch_status(batch_id: str, status: str) -> None:
 
 
 def update_batch_progress(batch_id: str, stage: str) -> None:
-    if stage not in {"ingestion", "classification", "extraction", "validation"}:
+    if stage not in {"ingestion", "classification", "extraction", "validation", "persistence", "review"}:
         raise ValueError("Unsupported extraction pipeline stage.")
     if not _patch(
         "extraction_batches",
@@ -532,7 +547,8 @@ def list_records(
         ).casefold()
         if search_text and search_text not in searchable:
             continue
-        if sender_text and sender_text not in str(sender_value or "").casefold():
+        normalized_sender_value = str(sender_value or "").casefold().strip()
+        if sender_text and normalized_sender_value != sender_text:
             continue
         records.append(
             {

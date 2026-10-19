@@ -26,7 +26,7 @@ import LivePipelineStepper from './components/LivePipelineStepper'
 const ACCEPTED_TYPES = ['application/pdf', 'image/png', 'image/jpeg']
 const ACCEPTED_EXTENSIONS = ['.pdf', '.png', '.jpg', '.jpeg']
 const MAX_FILE_SIZE = 20 * 1024 * 1024
-const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '')
+const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8001').replace(/\/$/, '')
 const EXTRACT_ENDPOINT = import.meta.env.VITE_EXTRACT_ENDPOINT || '/extract'
 const CONFIDENCE_THRESHOLD = 0.75
 

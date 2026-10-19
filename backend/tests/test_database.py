@@ -11,9 +11,12 @@ class DatabaseTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         root = Path(self.temp_dir.name)
+        db_path = root / "test.sqlite3"
+        if db_path.exists():
+            db_path.unlink()
         self.paths = (
             patch.object(database, "DATA_DIR", root),
-            patch.object(database, "DATABASE_PATH", root / "test.sqlite3"),
+            patch.object(database, "DATABASE_PATH", db_path),
         )
         for path_patch in self.paths:
             path_patch.start()

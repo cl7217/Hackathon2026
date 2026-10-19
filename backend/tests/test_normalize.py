@@ -55,6 +55,10 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(validate_user_value("id_number", "123456782", "clalit")[0], "green")
         self.assertEqual(validate_user_value("id_number", "123456789", "clalit")[0], "orange")
 
+    def test_sender_values_must_match_a_closed_allowlist(self):
+        self.assertEqual(validate_user_value("sender", "כללית", "clalit")[0], "green")
+        self.assertEqual(validate_user_value("sender", "ביתר עלית-גבע.א", "clalit")[0], "orange")
+
 
 if __name__ == "__main__":
     unittest.main()

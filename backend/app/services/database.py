@@ -467,7 +467,8 @@ def list_records(
             ).casefold()
             if search_text and search_text not in searchable:
                 continue
-            if sender_text and sender_text not in str(sender_field or "").casefold():
+            sender_value = str(sender_field or "").casefold().strip()
+            if sender_text and sender_value != sender_text:
                 continue
             records.append(
                 {

@@ -1,5 +1,4 @@
 import re
-from difflib import SequenceMatcher
 
 from app.config import SENDER_ALLOWLIST
 from app.pipeline.normalize import is_valid_israeli_id, normalize_date
@@ -43,11 +42,8 @@ def sender_is_allowed(value: str) -> bool:
     candidate = _compact(value)
     if not candidate:
         return False
-    best_match = max(
-        SequenceMatcher(None, candidate, _compact(allowed)).ratio()
-        for allowed in SENDER_ALLOWLIST
-    )
-    return best_match >= 0.88
+    allowed_values = {_compact(allowed) for allowed in SENDER_ALLOWLIST}
+    return candidate in allowed_values
 
 
 def validate_user_value(

@@ -3,7 +3,7 @@ create table if not exists public.extraction_batches (
     created_at timestamptz not null,
     status text not null check (status in ('queued', 'processing', 'complete', 'partial', 'failed')),
     stage text not null default 'ingestion'
-        check (stage in ('ingestion', 'classification', 'extraction', 'validation', 'complete'))
+        check (stage in ('ingestion', 'classification', 'extraction', 'validation', 'persistence', 'review'))
 );
 
 create table if not exists public.extraction_documents (

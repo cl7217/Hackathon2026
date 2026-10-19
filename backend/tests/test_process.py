@@ -1,7 +1,9 @@
+import json
 import unittest
 from unittest.mock import patch
 
 from app.pipeline.extractor import ExtractionCandidate
+from app.pipeline.gemini_extractor import ExtractionResponse
 from app.pipeline.ingest import PageImage
 from app.pipeline.process import extract_document
 
@@ -78,6 +80,10 @@ class PipelineTests(unittest.TestCase):
         extractor.extract_field_crop.assert_called_once()
         self.assertEqual(result[0].fields["first_name"].source, "vlm")
         self.assertTrue(result[0].fields["first_name"].handwritten)
+
+    def test_gemini_schema_does_not_emit_additional_properties(self):
+        schema = ExtractionResponse.model_json_schema()
+        self.assertNotIn("additionalProperties", json.dumps(schema, ensure_ascii=False))
 
 
 if __name__ == "__main__":

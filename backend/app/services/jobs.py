@@ -30,7 +30,9 @@ def process_batch(batch_id: str, uploads: list[tuple[str, str]]) -> None:
                     on_stage=lambda stage: update_batch_progress(batch_id, stage),
                     on_page_rendered=rendered_pages.append,
                 )
+                update_batch_progress(batch_id, "persistence")
                 _, document_id = save_extraction(filename, extractions, batch_id=batch_id)
+                update_batch_progress(batch_id, "review")
                 cache_document_pages(document_id, rendered_pages)
                 succeeded += 1
             except InvalidDocumentError:
