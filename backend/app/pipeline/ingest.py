@@ -1,8 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-import fitz
-
 from app.config import (
     ALLOWED_EXTENSIONS,
     MAX_DOCUMENT_PAGES,
@@ -24,6 +22,8 @@ class PageImage:
 
 
 def render_document(filename: str, content: bytes) -> list[PageImage]:
+    import fitz
+
     extension = Path(filename).suffix.lower()
     if extension not in ALLOWED_EXTENSIONS:
         raise InvalidDocumentError("סוג הקובץ אינו נתמך. יש להעלות PDF, PNG או JPG.")

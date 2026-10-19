@@ -5,7 +5,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
 
-from app.config import DATABASE_PATH, DATA_DIR
+from app.config import DATABASE_PATH, DATA_DIR, SUPABASE_ENABLED
+from app.pipeline.confidence import validate_user_value
 from app.schemas.extraction import FormExtraction
 
 
@@ -29,7 +30,8 @@ def initialize_database() -> None:
             CREATE TABLE IF NOT EXISTS batches (
                 id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT 'ingestion'
             );
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY,
@@ -76,21 +78,44 @@ def initialize_database() -> None:
             connection.execute(
                 "ALTER TABLE forms ADD COLUMN approved INTEGER NOT NULL DEFAULT 0"
             )
+        batch_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(batches)")
+        }
+        if "stage" not in batch_columns:
+            connection.execute(
+                "ALTER TABLE batches ADD COLUMN stage TEXT NOT NULL DEFAULT 'ingestion'"
+            )
 
 
 def create_batch(status: str = "queued") -> str:
     batch_id = str(uuid.uuid4())
     with _connect() as connection:
         connection.execute(
-            "INSERT INTO batches (id, created_at, status) VALUES (?, ?, ?)",
-            (batch_id, datetime.now(timezone.utc).isoformat(), status),
+            "INSERT INTO batches (id, created_at, status, stage) VALUES (?, ?, ?, ?)",
+            (
+                batch_id,
+                datetime.now(timezone.utc).isoformat(),
+                status,
+                "ingestion" if status in {"queued", "processing"} else "complete",
+            ),
         )
     return batch_id
 
 
 def update_batch_status(batch_id: str, status: str) -> None:
     with _connect() as connection:
-        connection.execute("UPDATE batches SET status = ? WHERE id = ?", (status, batch_id))
+        connection.execute(
+            "UPDATE batches SET status = ?, stage = ? WHERE id = ?",
+            (status, "complete" if status in {"complete", "partial", "failed"} else "ingestion", batch_id),
+        )
+
+
+def update_batch_progress(batch_id: str, stage: str) -> None:
+    with _connect() as connection:
+        connection.execute(
+            "UPDATE batches SET stage = ? WHERE id = ?",
+            (stage, batch_id),
+        )
 
 
 def save_extraction(
@@ -103,8 +128,8 @@ def save_extraction(
     with _connect() as connection:
         if new_batch:
             connection.execute(
-                "INSERT INTO batches (id, created_at, status) VALUES (?, ?, ?)",
-                (batch_id, now, "complete"),
+                "INSERT INTO batches (id, created_at, status, stage) VALUES (?, ?, ?, ?)",
+                (batch_id, now, "complete", "complete"),
             )
         connection.execute(
             "INSERT INTO documents (id, batch_id, filename, status, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -199,6 +224,7 @@ def read_batch(batch_id: str) -> dict | None:
             "id": batch["id"],
             "created_at": batch["created_at"],
             "status": batch["status"],
+            "stage": batch["stage"],
             "documents": output,
         }
 
@@ -225,17 +251,39 @@ def correct_field(
 ) -> bool:
     with _connect() as connection:
         row = connection.execute(
-            """SELECT fields.form_id FROM fields JOIN forms ON forms.id = fields.form_id
+            """SELECT fields.form_id, forms.form_type FROM fields
+            JOIN forms ON forms.id = fields.form_id
             WHERE forms.document_id = ? AND forms.page = ? AND fields.name = ?""",
             (document_id, page, field_name),
         ).fetchone()
         if row is None:
             return False
+        health_fund_row = connection.execute(
+            "SELECT value_json FROM fields WHERE form_id = ? AND name = 'health_fund'",
+            (row["form_id"],),
+        ).fetchone()
+        health_fund = (
+            json.loads(health_fund_row["value_json"])
+            if health_fund_row is not None and health_fund_row["value_json"]
+            else None
+        )
+        if isinstance(health_fund, list):
+            health_fund = health_fund[0] if health_fund else None
+        state, confidence, signals = validate_user_value(
+            field_name,
+            value,
+            row["form_type"],
+            health_fund,
+        )
         connection.execute(
-            """UPDATE fields SET value_json = ?, state = 'green', confidence = 1.0,
-            source = 'user', corrected_by_user = 1 WHERE form_id = ? AND name = ?""",
+            """UPDATE fields SET value_json = ?, state = ?, confidence = ?,
+            signals_json = ?, source = 'user', corrected_by_user = 1
+            WHERE form_id = ? AND name = ?""",
             (
                 json.dumps(value, ensure_ascii=False) if value is not None else None,
+                state,
+                confidence,
+                json.dumps(signals),
                 row["form_id"],
                 field_name,
             ),
@@ -367,3 +415,97 @@ def approved_rows(document_ids: list[str] | None = None) -> list[dict]:
                 }
             )
         return results
+
+
+def list_records(
+    *,
+    search: str | None = None,
+    status: str | None = None,
+    approved: bool | None = None,
+    sender: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    search_text = (search or "").casefold().strip()
+    sender_text = (sender or "").casefold().strip()
+    with _connect() as connection:
+        filters = []
+        parameters: list = []
+        if status:
+            filters.append("documents.status = ?")
+            parameters.append(status)
+        if approved is not None:
+            filters.append("forms.approved = ?")
+            parameters.append(int(approved))
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        rows = connection.execute(
+            f"""SELECT forms.id AS form_id, forms.document_id, forms.form_type,
+                       forms.page, forms.approved, documents.filename, documents.status,
+                       documents.error, documents.created_at, documents.batch_id
+                FROM forms JOIN documents ON documents.id = forms.document_id
+                {where}
+                ORDER BY documents.created_at DESC, forms.page
+                """,
+            parameters,
+        ).fetchall()
+        records = []
+        for row in rows:
+            fields = connection.execute(
+                "SELECT * FROM fields WHERE form_id = ? ORDER BY name", (row["form_id"],)
+            ).fetchall()
+            field_values = [_field_row(field) for field in fields]
+            sender_field = next(
+                (field["value"] for field in field_values if field["name"] == "sender"),
+                None,
+            )
+            searchable = " ".join(
+                [row["filename"], row["form_type"]]
+                + [
+                    str(field["value"] or "")
+                    for field in field_values
+                ]
+            ).casefold()
+            if search_text and search_text not in searchable:
+                continue
+            if sender_text and sender_text not in str(sender_field or "").casefold():
+                continue
+            records.append(
+                {
+                    "id": row["form_id"],
+                    "document_id": row["document_id"],
+                    "batch_id": row["batch_id"],
+                    "filename": row["filename"],
+                    "status": row["status"],
+                    "error": row["error"],
+                    "form_type": row["form_type"],
+                    "page": row["page"],
+                    "approved": bool(row["approved"]),
+                    "created_at": row["created_at"],
+                    "fields": field_values,
+                }
+            )
+        return {
+            "records": records[offset : offset + limit],
+            "total": len(records),
+            "limit": limit,
+            "offset": offset,
+        }
+
+
+if SUPABASE_ENABLED:
+    from app.services.supabase_store import (
+        approve_document,
+        approved_rows,
+        correct_field,
+        create_batch,
+        delete_document_form,
+        initialize_database,
+        list_records,
+        read_batch,
+        review_field,
+        save_document_error,
+        save_extraction,
+        update_batch_progress,
+        update_batch_status,
+        update_batch_progress,
+    )

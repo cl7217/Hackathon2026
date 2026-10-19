@@ -12,12 +12,16 @@ import {
   LoaderCircle,
   LockKeyhole,
   RotateCcw,
+  Search,
   ShieldCheck,
   Sparkles,
   Upload,
   X,
 } from 'lucide-react'
 import * as XLSX from '@e965/xlsx'
+import DocumentViewer from './components/DocumentViewer'
+import ExtractedDataForm from './components/ExtractedDataForm'
+import LivePipelineStepper from './components/LivePipelineStepper'
 
 const ACCEPTED_TYPES = ['application/pdf', 'image/png', 'image/jpeg']
 const ACCEPTED_EXTENSIONS = ['.pdf', '.png', '.jpg', '.jpeg']
@@ -32,7 +36,7 @@ const RESULT_FIELDS = [
   { key: 'idNumber', label: 'תעודת זהות', aliases: ['id_number', 'patient_id', 'identity_number', 'idNumber'] },
   { key: 'healthFund', label: 'קופת חולים', aliases: ['health_fund', 'healthFund', 'hmo', 'insurer', 'payer', 'kupat_holim'] },
   { key: 'centerNumber', label: 'מספר מרכזי', aliases: ['center_number', 'medical_center_number', 'centerNumber'] },
-  { key: 'documentDate', label: 'תאריך מסמך', aliases: ['document_date', 'date', 'documentDate'] },
+  { key: 'documentDate', label: 'תאריך קבלת הדגימה', aliases: ['document_date', 'date', 'documentDate'] },
   { key: 'sender', label: 'גורם שולח', aliases: ['sender', 'sending_entity', 'referring_entity'] },
   { key: 'commitmentNumber', label: 'מספר התחייבות', aliases: ['commitment_number', 'commitmentNumber'] },
   { key: 'receivedStamp', label: 'חותמת התקבל', aliases: ['received_stamp', 'receivedStamp', 'stamp_received', 'received', 'stamp'] },
@@ -57,6 +61,36 @@ function getFieldValue(source) {
   return ''
 }
 
+function validateEditedField(field, value, formType, healthFund) {
+  if (!value.trim()) return { state: 'empty', needsReview: true }
+  if (field.key === 'idNumber') {
+    const id = value.replace(/\D/g, '').padStart(9, '0')
+    const valid = /^\d{9}$/.test(id) && [...id].reduce((sum, digit, index) => {
+      const product = Number(digit) * (index % 2 ? 2 : 1)
+      return sum + Math.floor(product / 10) + product % 10
+    }, 0) % 10 === 0
+    return {
+      state: valid ? 'green' : 'orange',
+      needsReview: !valid,
+      signals: { field_valid: valid },
+    }
+  }
+  if (field.key === 'commitmentNumber') {
+    const prefixes = { clalit: '30', leumit: '12', meuhedet: '73', maccabi: '26' }
+    const fundToIssuer = { כללית: 'clalit', מכבי: 'maccabi', מאוחדת: 'meuhedet', לאומית: 'leumit' }
+    const matchedFund = Object.entries(fundToIssuer).find(([name]) => String(healthFund || '').includes(name))?.[1]
+    const prefix = prefixes[formType] || prefixes[matchedFund]
+    const values = value.split(/[,;\n]+/).map((item) => item.replace(/\D/g, '')).filter(Boolean)
+    const valid = values.length > 0 && (!prefix || values.every((item) => item.startsWith(prefix)))
+    return {
+      state: valid ? 'green' : 'orange',
+      needsReview: !valid,
+      signals: { commitment_prefix_match: valid },
+    }
+  }
+  return { state: 'green', needsReview: false }
+}
+
 function normalizeResults(payload) {
   const data = payload?.data ?? payload?.result ?? payload
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -69,6 +103,7 @@ function normalizeResults(payload) {
 
   const values = {}
   const uncertain = {}
+  const metadata = {}
   for (const field of RESULT_FIELDS) {
     const sourceKey = field.aliases.find((key) => data[key] !== undefined && data[key] !== null)
     const source = sourceKey ? data[sourceKey] : undefined
@@ -92,9 +127,18 @@ function normalizeResults(payload) {
 
     values[field.key] = value
     uncertain[field.key] = flagged || !value
+    metadata[field.key] = {
+      state: fieldObject.state || (value ? 'orange' : 'empty'),
+      needsReview: flagged || !value,
+      confidence: Number.isFinite(confidence) ? confidence : null,
+      bbox: Array.isArray(fieldObject.bbox) ? fieldObject.bbox : null,
+      handwritten: fieldObject.handwritten === true,
+      signals: fieldObject.signals || {},
+      raw: fieldObject.raw || null,
+    }
   }
 
-  return { values, uncertain }
+  return { values, uncertain, metadata }
 }
 
 function validateFile(file) {
@@ -110,13 +154,54 @@ function validateFile(file) {
 
 function App() {
   const inputRef = useRef(null)
+  const fieldUpdateQueue = useRef(Promise.resolve())
   const [documents, setDocuments] = useState([])
   const [isDragging, setIsDragging] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
+  const [pipelineStage, setPipelineStage] = useState('ingestion')
   const [previewId, setPreviewId] = useState(null)
   const [previewUrl, setPreviewUrl] = useState('')
+  const [selectedField, setSelectedField] = useState(RESULT_FIELDS[0].key)
   const [uploadError, setUploadError] = useState('')
+  const [records, setRecords] = useState([])
+  const [recordsTotal, setRecordsTotal] = useState(0)
+  const [recordsSearch, setRecordsSearch] = useState('')
+  const [recordsApproved, setRecordsApproved] = useState('')
+  const [recordsOffset, setRecordsOffset] = useState(0)
+  const [recordsError, setRecordsError] = useState('')
+  const [recordsLoading, setRecordsLoading] = useState(true)
+  const [recordsRefresh, setRecordsRefresh] = useState(0)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    const timer = window.setTimeout(async () => {
+      setRecordsLoading(true)
+      setRecordsError('')
+      const query = new URLSearchParams({ limit: '50', offset: String(recordsOffset) })
+      if (recordsSearch.trim()) query.set('search', recordsSearch.trim())
+      if (recordsApproved) query.set('approved', recordsApproved)
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/records?${query}`, {
+          signal: controller.signal,
+        })
+        if (!response.ok) throw new Error('לא ניתן לטעון את הרשומות השמורות.')
+        const result = await response.json()
+        setRecords(result.records || [])
+        setRecordsTotal(result.total || 0)
+      } catch (error) {
+        if (error.name !== 'AbortError') {
+          setRecordsError(error.message || 'לא ניתן לטעון את הרשומות השמורות.')
+        }
+      } finally {
+        if (!controller.signal.aborted) setRecordsLoading(false)
+      }
+    }, 200)
+    return () => {
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [recordsSearch, recordsApproved, recordsOffset, recordsRefresh])
 
   useEffect(() => {
     if (previewUrl) return () => URL.revokeObjectURL(previewUrl)
@@ -170,7 +255,7 @@ function App() {
 
   function removeDocument(id) {
     const document = documents.find((item) => item.id === id)
-    if (document?.documentId && document.status === 'complete') {
+    if (!document?.isSavedRecord && document?.documentId && document.status === 'complete') {
       fetch(`${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}?page=${document.page || 1}`, {
         method: 'DELETE',
       }).then((response) => {
@@ -187,6 +272,7 @@ function App() {
     if (!queue.length) return
 
     setIsProcessing(true)
+    setPipelineStage('ingestion')
     setUploadError('')
     setDocuments((current) =>
       current.map((item) =>
@@ -199,7 +285,7 @@ function App() {
     try {
       const body = new FormData()
       queue.forEach((document) => body.append('files', document.file))
-      const response = await fetch(`${API_BASE_URL}/api/batches`, { method: 'POST', body })
+      const response = await fetch(`${API_BASE_URL}/api/documents/upload`, { method: 'POST', body })
       if (!response.ok) {
         let detail = ''
         try {
@@ -212,11 +298,16 @@ function App() {
       }
       const { batch_id: batchId } = await response.json()
       let batch
+      const startedAt = Date.now()
       do {
         await new Promise((resolve) => window.setTimeout(resolve, 1000))
-        const statusResponse = await fetch(`${API_BASE_URL}/api/batches/${encodeURIComponent(batchId)}`)
+        const statusResponse = await fetch(`${API_BASE_URL}/api/documents/batch/${encodeURIComponent(batchId)}`)
         if (!statusResponse.ok) throw new Error('לא ניתן לקבל את מצב האצווה מהשרת.')
         batch = await statusResponse.json()
+        setPipelineStage(batch.stage || 'ingestion')
+        if (Date.now() - startedAt > 10 * 60 * 1000) {
+          throw new Error('עיבוד הקבצים נמשך זמן רב מדי. אפשר לנסות שוב מאוחר יותר.')
+        }
       } while (batch.status === 'queued' || batch.status === 'processing')
 
       const documentsByName = new Map()
@@ -255,8 +346,10 @@ function App() {
             ...document,
             id: page === 1 ? document.id : `${document.id}-page-${page}`,
             documentId: result.id,
+            batchId,
             page,
             ...normalizeResults({ data: fieldData }),
+            formType: form.form_type,
             reviewed: {},
             corrected: {},
             approved: false,
@@ -269,6 +362,8 @@ function App() {
       setDocuments((current) =>
         current.flatMap((item) => replacements.get(item.id) || [item]),
       )
+      setRecordsRefresh((current) => current + 1)
+      setPipelineStage('complete')
       if (batch.status === 'failed' || batch.status === 'partial') {
         setUploadError('חלק מהקבצים לא עובדו בהצלחה. פרטי השגיאה מוצגים בשורות המתאימות.')
       }
@@ -283,14 +378,42 @@ function App() {
             : item,
         ),
       )
+      setPipelineStage('failed')
     } finally {
     setIsProcessing(false)
     }
   }
 
   function openPreview(document) {
-    setPreviewUrl(URL.createObjectURL(document.file))
+    setPreviewUrl(document.file instanceof File ? URL.createObjectURL(document.file) : '')
     setPreviewId(document.id)
+  }
+
+  function openSavedRecord(record) {
+    const fieldData = Object.fromEntries(
+      (record.fields || []).map((field) => [field.name, field]),
+    )
+    const normalized = normalizeResults({ data: fieldData })
+    const id = `saved-${record.id}`
+    setDocuments((current) => current.some((item) => item.id === id)
+      ? current
+      : [...current, {
+          id,
+          isSavedRecord: true,
+          file: { name: record.filename, type: 'image/png' },
+          documentId: record.document_id,
+          batchId: record.batch_id,
+          page: record.page,
+          formType: record.form_type,
+          ...normalized,
+          reviewed: {},
+          corrected: {},
+          approved: record.approved,
+          status: 'complete',
+          error: '',
+        }])
+    setPreviewUrl('')
+    setPreviewId(id)
   }
 
   function closePreview() {
@@ -299,13 +422,24 @@ function App() {
   }
 
   function editField(document, field, value) {
+    const validation = validateEditedField(field, value, document.formType, document.values.healthFund)
     setDocuments((current) =>
       current.map((item) =>
         item.id === document.id
           ? {
               ...item,
               values: { ...item.values, [field.key]: value },
-              reviewed: { ...item.reviewed, [field.key]: true },
+              uncertain: { ...item.uncertain, [field.key]: validation.needsReview },
+              metadata: {
+                ...item.metadata,
+                [field.key]: {
+                  ...item.metadata?.[field.key],
+                  ...validation,
+                  handwritten: false,
+                  confidence: value ? 1 : 0,
+                },
+              },
+              reviewed: { ...item.reviewed, [field.key]: !validation.needsReview },
               corrected: { ...item.corrected, [field.key]: true },
               approved: false,
             }
@@ -317,22 +451,70 @@ function App() {
   async function markFieldReviewed(document, field) {
     try {
       if (document.documentId) {
+        if (document.corrected[field.key] && !(await persistField(document, field))) return
         const fieldName = encodeURIComponent(field.aliases[0])
-        const response = await fetch(
+        const update = () => fetch(
           `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/fields/${fieldName}/review?page=${document.page || 1}`,
           { method: 'POST' },
         )
+        const pending = fieldUpdateQueue.current.catch(() => {}).then(update)
+        fieldUpdateQueue.current = pending
+        const response = await pending
         if (!response.ok) throw new Error('לא ניתן לשמור את אישור השדה בשרת.')
       }
       setDocuments((current) =>
         current.map((item) =>
           item.id === document.id
-            ? { ...item, reviewed: { ...item.reviewed, [field.key]: true }, approved: false }
-            : item,
-        ),
+              ? {
+                  ...item,
+                  reviewed: { ...item.reviewed, [field.key]: true },
+                  metadata: {
+                    ...item.metadata,
+                    [field.key]: {
+                      ...item.metadata?.[field.key],
+                      state: 'green',
+                      needsReview: false,
+                      confidence: 1,
+                    },
+                  },
+                  approved: false,
+                }
+              : item,
+          ),
       )
+      setRecordsRefresh((current) => current + 1)
     } catch (requestError) {
       setUploadError(requestError.message || 'לא ניתן לשמור את בדיקת השדה.')
+    }
+  }
+
+  async function persistField(document, field) {
+    if (!document.documentId || !document.corrected[field.key]) return true
+    const value = document.values[field.key] || ''
+    const serializedValue = ['centerNumber', 'commitmentNumber'].includes(field.key)
+      ? value.split(/[,;\n]+/).map((item) => item.trim()).filter(Boolean)
+      : value || null
+    try {
+      const update = () => fetch(
+        `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/fields`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            page: document.page || 1,
+            fields: { [field.aliases[0]]: serializedValue },
+          }),
+        },
+      )
+      const pending = fieldUpdateQueue.current.catch(() => {}).then(update)
+      fieldUpdateQueue.current = pending
+      const response = await pending
+      if (!response.ok) throw new Error('לא ניתן לשמור את תיקוני השדה.')
+      setRecordsRefresh((current) => current + 1)
+      return true
+    } catch (requestError) {
+      setUploadError(requestError.message || 'לא ניתן לשמור את תיקוני השדה.')
+      return false
     }
   }
 
@@ -343,14 +525,24 @@ function App() {
     if (hasUnreviewedFields || document.status !== 'complete') return false
     try {
       if (document.documentId) {
-        for (const field of RESULT_FIELDS) {
-          if (!document.corrected[field.key]) continue
+        const correctedFields = Object.fromEntries(
+          RESULT_FIELDS
+            .filter((field) => document.corrected[field.key] && !document.reviewed[field.key])
+            .map((field) => [
+              field.aliases[0],
+              ['centerNumber', 'commitmentNumber'].includes(field.key)
+                ? document.values[field.key].split(/[,;\n]+/).map((value) => value.trim()).filter(Boolean)
+                : document.values[field.key] || null,
+            ]),
+        )
+        if (Object.keys(correctedFields).length) {
+          await fieldUpdateQueue.current.catch(() => {})
           const response = await fetch(
-            `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/fields/${encodeURIComponent(field.aliases[0])}?page=${document.page || 1}`,
+            `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/fields`,
             {
               method: 'PATCH',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ value: document.values[field.key] || null }),
+              body: JSON.stringify({ page: document.page || 1, fields: correctedFields }),
             },
           )
           if (!response.ok) throw new Error('לא ניתן לשמור את תיקוני הטופס.')
@@ -362,6 +554,13 @@ function App() {
         if (!response.ok) throw new Error('השרת דחה את אישור הטופס. בדקו שכל השדות סומנו.')
       }
       updateDocument(document.id, { approved: true })
+      setDocuments((current) => current.map((item) => item.id === document.id
+        ? { ...item, metadata: Object.fromEntries(Object.entries(item.metadata || {}).map(([key, meta]) => [
+            key,
+            { ...meta, state: 'green', needsReview: false },
+          ])) }
+        : item))
+      setRecordsRefresh((current) => current + 1)
       return true
     } catch (requestError) {
       setUploadError(requestError.message || 'לא ניתן לאשר את הטופס.')
@@ -402,6 +601,30 @@ function App() {
       }
     } catch (exportError) {
       setUploadError(`ייצוא לאקסל נכשל: ${exportError.message || 'נסו שוב.'}`)
+    } finally {
+      setIsExporting(false)
+    }
+  }
+
+  async function exportSavedRecords() {
+    const approvedRecords = records.filter((record) => record.approved)
+    const documentIds = [...new Set(approvedRecords.map((record) => record.document_id))]
+    if (!documentIds.length) return
+    setIsExporting(true)
+    setUploadError('')
+    try {
+      const query = new URLSearchParams()
+      documentIds.forEach((documentId) => query.append('document_ids', documentId))
+      const response = await fetch(`${API_BASE_URL}/api/export.xlsx?${query}`)
+      if (!response.ok) throw new Error('ייצוא הרשומות המאושרות נכשל.')
+      const downloadUrl = URL.createObjectURL(await response.blob())
+      const link = window.document.createElement('a')
+      link.href = downloadUrl
+      link.download = 'טפסים-מאושרים.xlsx'
+      link.click()
+      URL.revokeObjectURL(downloadUrl)
+    } catch (error) {
+      setUploadError(error.message || 'לא ניתן לייצא את הרשומות.')
     } finally {
       setIsExporting(false)
     }
@@ -509,7 +732,7 @@ function App() {
             <div className="mt-5 flex flex-col-reverse items-center justify-between gap-4 sm:flex-row">
               <p className="flex items-center gap-1.5 text-xs leading-5 text-slate-400">
                 <LockKeyhole size={14} className="shrink-0 text-slate-400" />
-                הקבצים משמשים לחילוץ בלבד ואינם נשמרים במערכת.
+                קובצי המקור נמחקים לאחר העיבוד; הרשומות נשמרות במערכת.
               </p>
               <button
                 type="button"
@@ -532,11 +755,16 @@ function App() {
                 )}
               </button>
             </div>
+            {isProcessing && (
+              <div className="mt-5 border-t border-slate-100 pt-5">
+                <LivePipelineStepper activeStage={pipelineStage} />
+              </div>
+            )}
           </div>
         </section>
 
         {documents.length > 0 && (
-          <section className="mx-auto mt-6 max-w-7xl overflow-hidden rounded-2xl border border-slate-200/90 bg-white shadow-card">
+          <section id="batch-history" className="mx-auto mt-6 max-w-7xl overflow-hidden rounded-2xl border border-slate-200/90 bg-white shadow-card">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-5 py-4 sm:px-7">
               <div>
                 <h2 className="text-base font-bold text-slate-800">תוצאות חילוץ</h2>
@@ -666,13 +894,144 @@ function App() {
           </section>
         )}
 
+        <section className="mx-auto mt-6 max-w-7xl overflow-hidden rounded-2xl border border-slate-200/90 bg-white shadow-card">
+          <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 px-5 py-4 sm:px-7">
+            <div>
+              <h2 className="text-base font-bold text-slate-800">היסטוריית אצוות ורשומות שמורות</h2>
+              <p className="mt-1 text-xs text-slate-400">
+                {recordsLoading ? 'טוען רשומות...' : `${recordsTotal} רשומות במערכת`}
+              </p>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="relative">
+                <Search size={16} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="search"
+                  value={recordsSearch}
+                  onChange={(event) => {
+                    setRecordsOffset(0)
+                    setRecordsSearch(event.target.value)
+                  }}
+                  placeholder="חיפוש בשם, ת.ז. או מספר"
+                  aria-label="חיפוש ברשומות השמורות"
+                  className="w-60 rounded-lg border border-slate-200 py-2.5 pr-9 pl-3 text-sm outline-none focus:border-[#6ba4c2] focus:ring-2 focus:ring-[#e8f4fa]"
+                />
+              </label>
+              <select
+                value={recordsApproved}
+                onChange={(event) => {
+                  setRecordsOffset(0)
+                  setRecordsApproved(event.target.value)
+                }}
+                aria-label="סינון לפי אישור"
+                className="rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-600 outline-none focus:border-[#6ba4c2]"
+              >
+                <option value="">כל סטטוסי האישור</option>
+                <option value="true">אושרו</option>
+                <option value="false">ממתינים לאישור</option>
+              </select>
+              <button
+                type="button"
+                disabled={!records.some((record) => record.approved) || isExporting}
+                onClick={exportSavedRecords}
+                className="flex items-center gap-2 rounded-lg bg-[#287eae] px-3 py-2.5 text-sm font-bold text-white disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                <FileSpreadsheet size={15} />
+                ייצוא מאושרים
+              </button>
+            </div>
+          </div>
+          {recordsError && (
+            <p role="alert" className="px-5 py-3 text-sm text-rose-700 sm:px-7">{recordsError}</p>
+          )}
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[1200px] border-collapse text-right text-sm">
+              <thead className="bg-slate-50 text-xs font-semibold text-slate-500">
+                <tr>
+                  <th className="px-4 py-3">קובץ / עמוד</th>
+                  {RESULT_FIELDS.map((field) => <th key={field.key} className="px-4 py-3">{field.label}</th>)}
+                  <th className="px-4 py-3">סטטוס</th>
+                  <th className="px-4 py-3">נוצר</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {records.map((record) => {
+                  const values = Object.fromEntries((record.fields || []).map((field) => [field.name, field.value]))
+                  return (
+                    <tr key={record.id} className="align-top hover:bg-slate-50/60">
+                      <td className="max-w-[220px] px-4 py-3">
+                        <button
+                          type="button"
+                          onClick={() => openSavedRecord(record)}
+                          className="block max-w-full truncate text-right font-semibold text-blue-700 hover:underline"
+                          title={`פתיחת ${record.filename}`}
+                        >
+                          {record.filename}
+                        </button>
+                        <span className="text-xs text-slate-400">{record.form_type} · עמוד {record.page}</span>
+                      </td>
+                      {RESULT_FIELDS.map((field) => {
+                        const value = getFieldValue(values[field.aliases[0]])
+                        const item = (record.fields || []).find((candidate) => candidate.name === field.aliases[0])
+                        return (
+                          <td key={field.key} className="px-4 py-3">
+                            <span className={`inline-block max-w-[160px] truncate rounded px-1.5 py-1 ${item?.needs_review ? 'bg-amber-100 text-amber-800' : 'text-slate-700'}`} title={value}>
+                              {value || (item?.needs_review ? 'לא בטוח — בדקי' : '—')}
+                            </span>
+                          </td>
+                        )
+                      })}
+                      <td className="whitespace-nowrap px-4 py-3">
+                        {record.approved
+                          ? <span className="flex items-center gap-1 text-xs font-semibold text-emerald-700"><CheckCircle2 size={14} /> אושר</span>
+                          : <span className="text-xs text-amber-700">ממתין לבדיקה</span>}
+                      </td>
+                      <td className="whitespace-nowrap px-4 py-3 text-xs text-slate-500">
+                        {record.created_at ? new Date(record.created_at).toLocaleDateString('he-IL') : '—'}
+                      </td>
+                    </tr>
+                  )
+                })}
+                {!recordsLoading && !recordsError && records.length === 0 && (
+                  <tr><td colSpan={RESULT_FIELDS.length + 3} className="px-4 py-10 text-center text-sm text-slate-400">לא נמצאו רשומות מתאימות.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex items-center justify-between border-t border-slate-100 px-5 py-3 text-xs text-slate-500 sm:px-7">
+            <span>
+              {recordsTotal
+                ? `מציגות ${recordsOffset + 1}–${Math.min(recordsOffset + records.length, recordsTotal)} מתוך ${recordsTotal}`
+                : 'אין רשומות להצגה'}
+            </span>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                disabled={!recordsOffset || recordsLoading}
+                onClick={() => setRecordsOffset((current) => Math.max(0, current - 50))}
+                className="rounded-md border border-slate-200 px-3 py-1.5 disabled:opacity-40"
+              >
+                הקודמות
+              </button>
+              <button
+                type="button"
+                disabled={recordsOffset + records.length >= recordsTotal || recordsLoading}
+                onClick={() => setRecordsOffset((current) => current + 50)}
+                className="rounded-md border border-slate-200 px-3 py-1.5 disabled:opacity-40"
+              >
+                הבאות
+              </button>
+            </div>
+          </div>
+        </section>
+
         <footer className="mx-auto mt-8 flex max-w-4xl items-center justify-center gap-2 text-xs text-slate-400">
           <ShieldCheck size={15} className="text-[#70a28b]" />
           המידע מוצג למטרת עיבוד המסמך בלבד
         </footer>
       </main>
 
-      {previewDocument && previewUrl && (
+      {previewDocument && (previewUrl || previewDocument.documentId) && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-3 sm:p-6"
           role="presentation"
@@ -700,75 +1059,29 @@ function App() {
             </header>
 
             <div className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto lg:grid-cols-2 lg:overflow-hidden">
-              <div className="flex min-h-[320px] items-center justify-center bg-slate-100 p-3 lg:min-h-0">
-                {previewDocument.file.type === 'application/pdf' ? (
-                  <iframe
-                    title={`תצוגת ${previewDocument.file.name}`}
-                    src={`${previewUrl}#page=${previewDocument.page || 1}`}
-                    className="h-[55vh] w-full rounded-lg bg-white lg:h-full"
-                  />
-                ) : (
-                  <img src={previewUrl} alt={`תצוגת ${previewDocument.file.name}`} className="max-h-[55vh] max-w-full rounded-lg object-contain lg:max-h-full" />
-                )}
-              </div>
+              <DocumentViewer
+                fallbackUrl={previewUrl}
+                fileName={previewDocument.file.name}
+                fileType={previewDocument.file.type}
+                documentId={previewDocument.documentId}
+                page={previewDocument.page}
+                selectedField={selectedField}
+                fields={previewDocument.metadata || {}}
+                onSelectField={setSelectedField}
+              />
 
-              <div className="min-h-0 overflow-y-auto p-5 sm:p-7">
-                <p className="mb-4 text-sm leading-6 text-slate-500">
-                  עברו על הערכים שסומנו בכתום. אפשר לערוך כל שדה; שדה לא ודאי חייב להיבדק לפני האישור.
-                </p>
-                <div className="space-y-4">
-                  {RESULT_FIELDS.map((field) => {
-                    const needsReview = previewDocument.uncertain[field.key] && !previewDocument.reviewed[field.key]
-                    const isReviewed = previewDocument.uncertain[field.key] && previewDocument.reviewed[field.key]
-                    return (
-                      <div key={field.key} className={`rounded-xl border p-3.5 ${needsReview ? 'border-amber-200 bg-amber-50/70' : 'border-slate-200 bg-white'}`}>
-                        <label htmlFor={`field-${field.key}`} className="mb-1.5 block text-xs font-semibold text-slate-600">
-                          {field.label} {needsReview && <span className="text-amber-700">· לא בטוח — בדקי</span>}
-                          {isReviewed && <span className="text-emerald-700">· נבדק</span>}
-                        </label>
-                        <div className="flex items-center gap-2">
-                          <input
-                            id={`field-${field.key}`}
-                            type="text"
-                            value={previewDocument.values[field.key] || ''}
-                            onChange={(event) => editField(previewDocument, field, event.target.value)}
-                            onBlur={async () => {
-                              if (!previewDocument.documentId || !previewDocument.corrected[field.key]) return
-                              try {
-                                const response = await fetch(
-                                  `${API_BASE_URL}/api/documents/${encodeURIComponent(previewDocument.documentId)}/fields/${encodeURIComponent(field.aliases[0])}?page=${previewDocument.page || 1}`,
-                                  {
-                                    method: 'PATCH',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ value: previewDocument.values[field.key] || null }),
-                                  },
-                                )
-                                if (!response.ok) throw new Error('לא ניתן לשמור את תיקוני השדה.')
-                              } catch (requestError) {
-                                setUploadError(requestError.message || 'לא ניתן לשמור את תיקוני השדה.')
-                              }
-                            }}
-                            placeholder="לא זוהה — ניתן להזין ידנית"
-                            className={`min-w-0 flex-1 rounded-lg border px-3 py-2.5 text-sm text-slate-800 outline-none transition focus:ring-2 ${
-                              needsReview
-                                ? 'border-amber-300 bg-white focus:border-amber-400 focus:ring-amber-100'
-                                : 'border-slate-200 focus:border-[#6ba4c2] focus:ring-[#e8f4fa]'
-                            }`}
-                          />
-                          {needsReview && (
-                            <button
-                              type="button"
-                              onClick={() => markFieldReviewed(previewDocument, field)}
-                              className="shrink-0 rounded-lg border border-amber-300 bg-white px-2.5 py-2.5 text-xs font-semibold text-amber-800 hover:bg-amber-100"
-                            >
-                              בדקתי
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
+              <div className="min-h-0 overflow-y-auto">
+                <ExtractedDataForm
+                  fields={RESULT_FIELDS}
+                  values={previewDocument.values}
+                  metadata={previewDocument.metadata || {}}
+                  selectedField={selectedField}
+                  reviewed={previewDocument.reviewed}
+                  onSelectField={setSelectedField}
+                  onChange={(field, value) => editField(previewDocument, field, value)}
+                  onBlur={(field) => persistField(previewDocument, field)}
+                  onMarkReviewed={(field) => markFieldReviewed(previewDocument, field)}
+                />
                 <div className="sticky bottom-0 mt-5 flex items-center justify-between gap-3 border-t border-slate-100 bg-white py-4">
                   <span className="text-xs text-slate-400">
                     {RESULT_FIELDS.filter((field) => previewDocument.uncertain[field.key] && !previewDocument.reviewed[field.key]).length

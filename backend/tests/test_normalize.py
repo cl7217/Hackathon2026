@@ -6,6 +6,7 @@ from app.pipeline.normalize import (
     normalize_id_number,
     normalize_identifier_list,
 )
+from app.pipeline.confidence import evaluate_field, validate_user_value
 
 
 class NormalizeTests(unittest.TestCase):
@@ -28,6 +29,31 @@ class NormalizeTests(unittest.TestCase):
             normalize_identifier_list([" 001 23 ", "00123", "456"]),
             ["00123", "456"],
         )
+
+    def test_commitment_prefixes_match_health_fund_and_form_issuer(self):
+        state, _, signals = evaluate_field(
+            "commitment_number",
+            ["300123", "300456"],
+            page=1,
+            bbox=[0, 0, 10, 10],
+            handwritten=False,
+            ocr_text="300123 300456",
+            classifier_confident=True,
+            form_type="unknown",
+            health_fund="כללית",
+        )
+        self.assertEqual(state, "green")
+        self.assertTrue(signals["commitment_prefix_match"])
+
+        state, _, signals = validate_user_value(
+            "commitment_number", ["120123"], "clalit", "כללית"
+        )
+        self.assertEqual(state, "orange")
+        self.assertFalse(signals["commitment_prefix_match"])
+
+    def test_corrected_id_requires_a_valid_israeli_checksum(self):
+        self.assertEqual(validate_user_value("id_number", "123456782", "clalit")[0], "green")
+        self.assertEqual(validate_user_value("id_number", "123456789", "clalit")[0], "orange")
 
 
 if __name__ == "__main__":
