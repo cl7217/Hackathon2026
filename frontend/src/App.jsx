@@ -28,6 +28,7 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024
 const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8001').replace(/\/$/, '')
 const EXTRACT_ENDPOINT = import.meta.env.VITE_EXTRACT_ENDPOINT || '/extract'
 const CONFIDENCE_THRESHOLD = 0.75
+const API_REQUEST_TIMEOUT_MS = 30_000
 const HEALTH_FUND_PREFIXES = { clalit: '30', leumit: '12', meuhedet: '73', maccabi: '26' }
 const HEALTH_FUND_NAMES = ['כללית', 'מכבי', 'מאוחדת', 'לאומית']
 const SENDER_NAMES = [
@@ -41,13 +42,26 @@ const RESULT_FIELDS = [
   { key: 'firstName', label: 'שם פרטי', aliases: ['first_name', 'patient_first_name', 'patientFirstName', 'firstName'] },
   { key: 'lastName', label: 'שם משפחה', aliases: ['last_name', 'patient_last_name', 'patientLastName', 'lastName'] },
   { key: 'idNumber', label: 'תעודת זהות', aliases: ['id_number', 'patient_id', 'identity_number', 'idNumber'] },
-  { key: 'healthFund', label: 'קופת חולים', aliases: ['health_fund', 'healthFund', 'hmo', 'insurer', 'payer', 'kupat_holim'] },
   { key: 'centerNumber', label: 'מספר מרכזי', aliases: ['center_number', 'medical_center_number', 'centerNumber'] },
   { key: 'documentDate', label: 'תאריך קבלת הדגימה', aliases: ['document_date', 'date', 'documentDate'] },
   { key: 'sender', label: 'גורם שולח', aliases: ['sender', 'sending_entity', 'referring_entity'] },
   { key: 'commitmentNumber', label: 'מספר התחייבות', aliases: ['commitment_number', 'commitmentNumber'] },
-  { key: 'receivedStamp', label: 'חותמת התקבל', aliases: ['received_stamp', 'receivedStamp', 'stamp_received', 'received', 'stamp'] },
 ]
+
+async function fetchWithTimeout(url, options) {
+  const controller = new AbortController()
+  const timeout = window.setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS)
+  try {
+    return await fetch(url, { ...options, signal: controller.signal })
+  } catch (requestError) {
+    if (controller.signal.aborted) {
+      throw new Error('הבקשה לשרת נמשכה זמן רב מדי. בדקו את החיבור ונסו שוב.')
+    }
+    throw requestError
+  } finally {
+    window.clearTimeout(timeout)
+  }
+}
 
 function formatFileSize(bytes) {
   return bytes < 1024 * 1024
@@ -95,7 +109,7 @@ function getFieldValue(source) {
   return ''
 }
 
-function validateEditedField(field, value, formType, healthFund) {
+function validateEditedField(field, value, formType, sender) {
   if (!value.trim()) return { state: 'empty', needsReview: true }
   const compact = (input) => input.toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
   const values = value.split(/[,;\n]+/).map((item) => item.trim()).filter(Boolean)
@@ -148,17 +162,9 @@ function validateEditedField(field, value, formType, healthFund) {
       signals: { field_valid: allowed },
     }
   }
-  if (field.key === 'receivedStamp') {
-    const valid = compact(value).includes(compact('התקבל'))
-    return {
-      state: valid ? 'green' : 'orange',
-      needsReview: !valid,
-      signals: { field_valid: valid },
-    }
-  }
   if (field.key === 'commitmentNumber') {
     const fundToIssuer = { כללית: 'clalit', מכבי: 'maccabi', מאוחדת: 'meuhedet', לאומית: 'leumit' }
-    const matchedFund = Object.entries(fundToIssuer).find(([name]) => String(healthFund || '').includes(name))?.[1]
+    const matchedFund = Object.entries(fundToIssuer).find(([name]) => String(sender || '').includes(name))?.[1]
     const prefix = HEALTH_FUND_PREFIXES[formType] || HEALTH_FUND_PREFIXES[matchedFund]
     const numeric = values.length > 0 && values.every((item) => /^\d+(?:[\s./-]\d+)*$/.test(item))
     const valid = numeric && (!prefix || values.every((item) => item.replace(/\D/g, '').startsWith(prefix)))
@@ -243,6 +249,7 @@ function validateFile(file) {
 function App() {
   const inputRef = useRef(null)
   const fieldUpdateQueue = useRef(Promise.resolve())
+  const approvingDocumentIdsRef = useRef(new Set())
   const [documents, setDocuments] = useState([])
   const [isDragging, setIsDragging] = useState(false)
   const [isProcessing, setIsProcessing] = useState(false)
@@ -260,6 +267,7 @@ function App() {
   const [recordsError, setRecordsError] = useState('')
   const [recordsLoading, setRecordsLoading] = useState(true)
   const [recordsRefresh, setRecordsRefresh] = useState(0)
+  const [approvingDocumentIds, setApprovingDocumentIds] = useState(() => new Set())
 
   useEffect(() => {
     const controller = new AbortController()
@@ -513,7 +521,7 @@ function App() {
   }
 
   function editField(document, field, value) {
-    const validation = validateEditedField(field, value, document.formType, document.values.healthFund)
+    const validation = validateEditedField(field, value, document.formType, document.values.sender)
     setDocuments((current) =>
       current.map((item) =>
         item.id === document.id
@@ -544,7 +552,7 @@ function App() {
       if (document.documentId) {
         if (document.corrected[field.key] && !(await persistField(document, field))) return
         const fieldName = encodeURIComponent(field.aliases[0])
-        const update = () => fetch(
+        const update = () => fetchWithTimeout(
           `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/fields/${fieldName}/review?page=${document.page || 1}`,
           { method: 'POST' },
         )
@@ -586,7 +594,7 @@ function App() {
       ? value.split(/[,;\n]+/).map((item) => item.trim()).filter(Boolean)
       : value || null
     try {
-      const update = () => fetch(
+      const update = () => fetchWithTimeout(
         `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/fields`,
         {
           method: 'PATCH',
@@ -610,12 +618,17 @@ function App() {
   }
 
   async function approveDocument(document) {
+    if (document.approved) return true
+    if (approvingDocumentIdsRef.current.has(document.id)) return false
     const hasUnreviewedFields = RESULT_FIELDS.some(
       (field) => document.uncertain[field.key] && !document.reviewed[field.key],
     )
     if (hasUnreviewedFields || document.status !== 'complete') return false
+    approvingDocumentIdsRef.current.add(document.id)
+    setApprovingDocumentIds((current) => new Set(current).add(document.id))
     try {
       if (document.documentId) {
+        await fieldUpdateQueue.current
         const correctedFields = Object.fromEntries(
           RESULT_FIELDS
             .filter((field) => document.corrected[field.key] && !document.reviewed[field.key])
@@ -627,8 +640,7 @@ function App() {
             ]),
         )
         if (Object.keys(correctedFields).length) {
-          await fieldUpdateQueue.current.catch(() => {})
-          const response = await fetch(
+          const response = await fetchWithTimeout(
             `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/fields`,
             {
               method: 'PATCH',
@@ -638,7 +650,7 @@ function App() {
           )
           if (!response.ok) throw new Error('לא ניתן לשמור את תיקוני הטופס.')
         }
-        const response = await fetch(
+        const response = await fetchWithTimeout(
           `${API_BASE_URL}/api/documents/${encodeURIComponent(document.documentId)}/approve?page=${document.page || 1}`,
           { method: 'POST' },
         )
@@ -656,6 +668,13 @@ function App() {
     } catch (requestError) {
       setUploadError(requestError.message || 'לא ניתן לאשר את הטופס.')
       return false
+    } finally {
+      approvingDocumentIdsRef.current.delete(document.id)
+      setApprovingDocumentIds((current) => {
+        const next = new Set(current)
+        next.delete(document.id)
+        return next
+      })
     }
   }
 
@@ -1100,12 +1119,14 @@ function App() {
                             {document.status === 'complete' && (
                               <button
                                 type="button"
-                                disabled={!canApprove && !document.approved}
+                                disabled={approvingDocumentIds.has(document.id) || (!canApprove && !document.approved)}
                                 onClick={() => approveDocument(document)}
                                 className="flex items-center gap-1 rounded-md px-2.5 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:text-slate-300"
                                 title={unreviewedCount ? 'יש לבדוק את השדות המסומנים לפני האישור' : ''}
                               >
-                                <Check size={14} /> {document.approved ? 'אושר' : 'אישור'}
+                                {approvingDocumentIds.has(document.id)
+                                  ? <><LoaderCircle size={14} className="animate-spin" /> מאשר...</>
+                                  : <><Check size={14} /> {document.approved ? 'אושר' : 'אישור'}</>}
                               </button>
                             )}
                             {document.status === 'error' && (
@@ -1384,15 +1405,16 @@ function App() {
                   </span>
                   <button
                     type="button"
-                    disabled={RESULT_FIELDS.some((field) => previewDocument.uncertain[field.key] && !previewDocument.reviewed[field.key])}
+                    disabled={approvingDocumentIds.has(previewDocument.id) || RESULT_FIELDS.some((field) => previewDocument.uncertain[field.key] && !previewDocument.reviewed[field.key])}
                     onClick={async () => {
                       const approved = await approveDocument(previewDocument)
                       if (approved) closePreview()
                     }}
                     className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-bold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-slate-300"
                   >
-                    <Check size={16} />
-                    {previewDocument.approved ? 'אושר' : 'אישור הטופס'}
+                    {approvingDocumentIds.has(previewDocument.id)
+                      ? <><LoaderCircle size={16} className="animate-spin" /> מאשר...</>
+                      : <><Check size={16} /> {previewDocument.approved ? 'אושר' : 'אישור הטופס'}</>}
                   </button>
                 </div>
               </div>

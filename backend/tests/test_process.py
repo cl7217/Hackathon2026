@@ -126,7 +126,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(
             stages,
             ["ingestion", "classification", "extraction"]
-            + ["validation"] * 9,
+            + ["validation"] * 7,
         )
         self.assertEqual(read_ocr.call_count, 1)
 
@@ -201,7 +201,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(received_date.raw, "20.10.2026")
         self.assertTrue(received_date.needs_review)
 
-    def test_ocr_rules_extractor_returns_all_nine_canonical_fields(self):
+    def test_ocr_rules_extractor_returns_all_seven_canonical_fields(self):
         candidate = OCRRulesExtractor().extract(
             b"",
             form_type="clalit",
@@ -210,6 +210,7 @@ class PipelineTests(unittest.TestCase):
             height=20,
         )
         self.assertEqual(tuple(candidate.fields), FIELD_NAMES)
+        self.assertEqual(len(candidate.fields), 7)
         self.assertEqual(candidate.fields["first_name"]["value"], "דנה")
 
     def test_hybrid_merge_uses_local_values_and_flags_disagreements(self):

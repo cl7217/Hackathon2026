@@ -98,25 +98,6 @@ def _recognized_sender(text: str) -> str | None:
     return next(iter(matches.values())) if len(matches) == 1 else None
 
 
-def _explicit_health_fund(text: str) -> str | None:
-    health_funds = ("כללית", "מכבי", "מאוחדת", "לאומית")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    for index, line in enumerate(lines):
-        if re.search(r"קופת\s*חולים|קופה|מבוטח\s*ב", line):
-            search_text = " ".join(lines[index:index + 2])
-            match = next(
-                (
-                    name
-                    for name in health_funds
-                    if _compact(name) in _compact(search_text)
-                ),
-                None,
-            )
-            if match:
-                return match
-    return None
-
-
 def _extract_text_fields(text: str, form_type: str) -> dict[str, dict]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     fields = extract_with_rules(text, form_type)
@@ -142,13 +123,6 @@ def _extract_text_fields(text: str, form_type: str) -> dict[str, dict]:
     recognized_sender = _recognized_sender(sender) if sender else None
     if recognized_sender:
         fields["sender"] = _field(recognized_sender, sender or recognized_sender)
-
-    health_fund = _explicit_health_fund(text)
-    if health_fund:
-        fields["health_fund"] = _field(health_fund)
-
-    if re.search(r"התקבל", text):
-        fields["received_stamp"] = _field("התקבל")
 
     return fields
 

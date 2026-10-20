@@ -47,7 +47,7 @@ class ExtractedValue(StrictModel):
 
 
 class ExtractionResponse(StrictModel):
-    # תשובה שטוחה: בדיוק תשעת השדות הקנוניים.
+    # תשובה שטוחה: בדיוק שבעת השדות הקנוניים.
     first_name: ExtractedValue
     last_name: ExtractedValue
     id_number: ExtractedValue
@@ -55,8 +55,6 @@ class ExtractionResponse(StrictModel):
     document_date: ExtractedValue
     sender: ExtractedValue
     commitment_number: ExtractedValue
-    health_fund: ExtractedValue
-    received_stamp: ExtractedValue
 
 
 class CropResponse(StrictModel):
@@ -232,14 +230,13 @@ class GeminiExtractor:
 {FIELD_EXTRACTION_RULES}
 
 מבנה הפלט:
-החזר JSON שטוח עם תשעת המפתחות:
+החזר JSON שטוח עם שבעת המפתחות:
 first_name, last_name, id_number, center_number,
-document_date, sender, commitment_number,
-health_fund, received_stamp.
+document_date, sender, commitment_number.
 
 אין להשתמש במפתח date.
 אין לעטוף את התשובה במפתח fields.
-כל אחד מתשעת השדות חייב להופיע.
+כל אחד משבעת השדות חייב להופיע.
 כל שדה מכיל value, raw, bbox, handwritten.
 
 סוג הטופס שסווג: {form_type}

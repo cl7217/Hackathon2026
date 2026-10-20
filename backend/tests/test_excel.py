@@ -22,7 +22,6 @@ class ExcelExportTests(unittest.TestCase):
                 "document_date": "20/10/2026",
                 "sender": "כללית",
                 "commitment_number": ["300123", "300456"],
-                "received_stamp": "התקבל",
             }
         ],
     )

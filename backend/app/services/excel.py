@@ -18,7 +18,6 @@ HEADERS = (
     ("document_date", "תאריך קבלת הדגימה"),
     ("sender", "גורם שולח"),
     ("commitment_number", "מספר התחייבות"),
-    ("received_stamp", "חותמת התקבל"),
 )
 
 

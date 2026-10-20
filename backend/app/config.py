@@ -22,8 +22,6 @@ FIELD_NAMES = (
     "document_date",
     "sender",
     "commitment_number",
-    "health_fund",
-    "received_stamp",
 )
 
 EXTRACTION_MODE = os.getenv(
