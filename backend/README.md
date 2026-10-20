@@ -61,11 +61,11 @@ VITE_API_URL=http://127.0.0.1:8001
 ברירת המחדל ב-`backend\.env.example` היא:
 
 ```dotenv
-EXTRACTION_MODE=local_ocr_rules
+EXTRACTION_MODE=hybrid
 OCR_LANGUAGES=heb+eng
 ```
 
-העתיקו את הקובץ ל-`backend\.env` לפני הפעלה. במצב ברירת המחדל, החילוץ מתבצע באמצעות Tesseract וכללים מקומיים ואינו מתחבר ל-Gemini או למודל חיצוני. אין צורך להגדיר מפתח Gemini.
+העתיקו את הקובץ ל-`backend\.env` לפני הפעלה. במצב ברירת המחדל, המערכת מנסה OCR מקומי ו-Gemini יחד, אך אם Gemini אינו זמין או נכשל, היא ממשיכה עם OCR מקומי במקום להפסיק.
 
 ללא פרטי Supabase, הנתונים נשמרים ב-SQLite בתיקיית `backend\data`; תמונות התצוגה נשמרות בזיכרון בלבד. כדי לשנות את מיקום נתוני SQLite והיומן, אפשר להגדיר ב-`backend\.env`:
 

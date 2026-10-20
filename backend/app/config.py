@@ -28,7 +28,7 @@ FIELD_NAMES = (
 
 EXTRACTION_MODE = os.getenv(
     "EXTRACTION_MODE",
-    "local_ocr_rules",
+    "hybrid",
 ).strip().casefold()
 if EXTRACTION_MODE not in {"local_ocr_rules", "gemini", "hybrid"}:
     raise ValueError(

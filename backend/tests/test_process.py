@@ -1,3 +1,5 @@
+import importlib
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,6 +14,35 @@ from app.services import audit
 
 
 class PipelineTests(unittest.TestCase):
+    def test_signals_accepts_metadata_with_unknown_engine_agreement(self):
+        from app.schemas.extraction import ExtractedField
+
+        field = ExtractedField(
+            value="דנה",
+            signals={
+                "found": True,
+                "field_valid": True,
+                "engine_agreement": None,
+            },
+        )
+
+        self.assertIsNone(field.signals["engine_agreement"])
+
+    def test_default_extraction_mode_prefers_hybrid_for_local_fallback(self):
+        import app.config as config
+
+        original = os.environ.get("EXTRACTION_MODE")
+        os.environ.pop("EXTRACTION_MODE", None)
+        try:
+            importlib.reload(config)
+            self.assertEqual(config.EXTRACTION_MODE, "hybrid")
+        finally:
+            if original is None:
+                os.environ.pop("EXTRACTION_MODE", None)
+            else:
+                os.environ["EXTRACTION_MODE"] = original
+            importlib.reload(config)
+
     def test_audit_records_field_presence_without_document_text_or_values(self):
         from app.pipeline import process
 

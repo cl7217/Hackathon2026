@@ -389,7 +389,7 @@ function App() {
       const { batch_id: batchId } = await response.json()
       let batch
       const startedAt = Date.now()
-      do {
+      while (true) {
         await new Promise((resolve) => window.setTimeout(resolve, 1000))
         const statusResponse = await fetch(`${API_BASE_URL}/api/documents/batch/${encodeURIComponent(batchId)}`)
         if (!statusResponse.ok) throw new Error('לא ניתן לקבל את מצב האצווה מהשרת.')
@@ -398,7 +398,8 @@ function App() {
         if (Date.now() - startedAt > 10 * 60 * 1000) {
           throw new Error('עיבוד הקבצים נמשך זמן רב מדי. אפשר לנסות שוב מאוחר יותר.')
         }
-      } while (batch.status === 'queued' || batch.status === 'processing')
+        if (!['queued', 'processing'].includes(batch.status)) break
+      }
 
       const documentsByName = new Map()
       for (const result of batch.documents || []) {

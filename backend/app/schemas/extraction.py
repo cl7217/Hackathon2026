@@ -14,7 +14,7 @@ class ExtractedField(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     state: Literal["green", "orange", "empty"] = "empty"
     needs_review: bool = True
-    signals: dict[str, bool] = Field(default_factory=dict)
+    signals: dict[str, bool | None] = Field(default_factory=dict)
     handwritten: bool = False
     corrected_by_user: bool = False
 

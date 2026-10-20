@@ -77,7 +77,7 @@ def validate_user_value(
     value: str | list[str] | None,
     form_type: str,
     health_fund: str | None = None,
-) -> tuple[str, float, dict[str, bool]]:
+) -> tuple[str, float, dict[str, bool | None]]:
     if value is None or value == "" or value == []:
         return "empty", 0.0, {"found": False}
     candidate = value if isinstance(value, str) else " ".join(value)
@@ -125,7 +125,7 @@ def evaluate_field(
     form_type: str | None = None,
     health_fund: str | None = None,
     minimum_confidence: float = 0.75,
-) -> tuple[str, float, dict[str, bool]]:
+) -> tuple[str, float, dict[str, bool | None]]:
     if value is None or value == "":
         return "empty", 0.0, {"found": False}
 
