@@ -1,35 +1,46 @@
 from collections.abc import Callable
 import logging
+from pathlib import Path
 import time
+import uuid
 
-from app.config import FIELD_NAMES
-from app.pipeline.classify import classify_form
+from app.config import EXTRACTION_MODE, FIELD_NAMES, OCR_LANGUAGES
+from app.pipeline.classify import FormType, classify_form
 from app.pipeline.confidence import evaluate_field
+from app.pipeline.extractor import (
+    ExtractionCandidate,
+    Extractor,
+    ExtractorUnavailableError,
+)
 from app.pipeline.ingest import PageImage, render_document
-from app.pipeline.local_extractor import read_ocr
-from app.pipeline.gemini_extractor import GeminiExtractor
+from app.pipeline.ocr_extractor import OCRRulesExtractor, read_ocr
 from app.pipeline.normalize import (
     normalize_date,
     normalize_id_number,
     normalize_identifier_list,
     normalize_text,
 )
-from app.pipeline.extractor import ExtractorUnavailableError
 from app.schemas.extraction import ExtractedField, FormExtraction
+from app.services.audit import record_event
 
 logger = logging.getLogger("pipeline_logger")
 
-# אתחול עצל: מפתח חסר לא יפיל את הייבוא של המודול.
-# כשל Gemini לא מפעיל מנוע חלופי.
-_EXTRACTOR: GeminiExtractor | None = None
+# Gemini is only instantiated when explicitly selected or cross-checked.
+_EXTRACTOR: OCRRulesExtractor | None = None
+_GEMINI_EXTRACTOR = None
 
 
-def _get_extractor() -> GeminiExtractor:
-    global _EXTRACTOR
+def _get_extractor(provider: str = "local_ocr_rules") -> Extractor:
+    global _EXTRACTOR, _GEMINI_EXTRACTOR
 
+    if provider == "gemini":
+        if _GEMINI_EXTRACTOR is None:
+            from app.pipeline.gemini_extractor import GeminiExtractor
+
+            _GEMINI_EXTRACTOR = GeminiExtractor()
+        return _GEMINI_EXTRACTOR
     if _EXTRACTOR is None:
-        _EXTRACTOR = GeminiExtractor()
-
+        _EXTRACTOR = OCRRulesExtractor()
     return _EXTRACTOR
 
 
@@ -79,6 +90,77 @@ def _normalize_candidate(
     return None, handwritten
 
 
+def _normalized_value(name: str, field: dict) -> str | tuple[str, ...] | None:
+    value, _ = _normalize_candidate(name, field)
+    if isinstance(value, list):
+        return tuple(sorted(normalize_identifier_list(value)))
+    return value
+
+
+def _merge_candidates(
+    local_candidate: ExtractionCandidate | None,
+    gemini_candidate: ExtractionCandidate | None,
+) -> ExtractionCandidate:
+    if local_candidate is None and gemini_candidate is None:
+        raise ExtractorUnavailableError("No extraction provider returned a result.")
+
+    merged = {}
+    for name in FIELD_NAMES:
+        local_field = (
+            local_candidate.fields.get(name, {})
+            if local_candidate is not None
+            else {}
+        )
+        gemini_field = (
+            gemini_candidate.fields.get(name, {})
+            if gemini_candidate is not None
+            else {}
+        )
+        if not isinstance(local_field, dict):
+            local_field = {}
+        if not isinstance(gemini_field, dict):
+            gemini_field = {}
+
+        local_value = _normalized_value(name, local_field)
+        gemini_value = _normalized_value(name, gemini_field)
+        cross_check_complete = (
+            local_candidate is not None and gemini_candidate is not None
+        )
+        agrees = (
+            local_value == gemini_value
+            if cross_check_complete
+            else None
+        )
+
+        if local_value is not None:
+            selected = dict(local_field)
+            source = "local_ocr_rules"
+        elif gemini_value is not None:
+            selected = dict(gemini_field)
+            source = "gemini"
+        else:
+            selected = dict(local_field or gemini_field)
+            source = "local_ocr_rules" if local_candidate is not None else "gemini"
+
+        other_field = gemini_field if source == "local_ocr_rules" else local_field
+        for metadata_key in ("bbox", "raw"):
+            if not selected.get(metadata_key) and other_field.get(metadata_key):
+                selected[metadata_key] = other_field[metadata_key]
+        selected["handwritten"] = (
+            selected.get("handwritten") is True
+            or other_field.get("handwritten") is True
+        )
+        selected["_engine_agreement"] = agrees
+        selected["_engine_check_incomplete"] = not cross_check_complete
+        selected["_engine_source"] = source
+        merged[name] = selected
+
+    return ExtractionCandidate(
+        fields=merged,
+        raw_response="",
+    )
+
+
 def _valid_bbox(
     bbox: object,
     *,
@@ -118,12 +200,39 @@ def _empty_fields() -> dict:
             confidence=0.0,
             state="orange",
             needs_review=True,
-            signals=["extraction_failed"],
+            signals={"extraction_failed": True},
             handwritten=False,
-            source="vlm",
+            source="ocr" if EXTRACTION_MODE == "local_ocr_rules" else "vlm",
         )
         for name in FIELD_NAMES
     }
+
+
+def _audit_field_results(
+    fields: dict[str, ExtractedField],
+    *,
+    trace_id: str,
+    batch_id: str | None,
+    page: int,
+) -> None:
+    for name, field in fields.items():
+        record_event(
+            "field.validated",
+            function="evaluate_field",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            page=page,
+            status=field.state,
+            details={
+                "field": name,
+                "found": field.value is not None,
+                "confidence": field.confidence,
+                "handwritten": field.handwritten,
+                "source": field.source,
+                "signals": sorted(field.signals),
+                "bbox_found": field.bbox is not None,
+            },
+        )
 
 
 def extract_document(
@@ -131,16 +240,39 @@ def extract_document(
     content: bytes,
     on_stage: Callable[[str], None] | None = None,
     on_page_rendered: Callable[[PageImage], None] | None = None,
+    *,
+    trace_id: str | None = None,
+    batch_id: str | None = None,
 ) -> list[FormExtraction]:
     pipeline_start_time = time.time()
+    trace_id = trace_id or str(uuid.uuid4())
 
     logger.info(
-        "[PIPELINE START] Processing document: %s; bytes=%d",
-        filename,
+        "[PIPELINE START] Processing document; extension=%s; bytes=%d",
+        Path(filename).suffix.lower(),
         len(content),
+    )
+    record_event(
+        "document.processing_started",
+        function="extract_document",
+        trace_id=trace_id,
+        batch_id=batch_id,
+        details={
+            "file_extension": Path(filename).suffix.lower(),
+            "file_bytes": len(content),
+            "extraction_mode": EXTRACTION_MODE,
+        },
     )
 
     def report_stage(stage: str) -> None:
+        record_event(
+            "pipeline.stage_started",
+            function="extract_document",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            status=stage,
+            details={"stage": stage},
+        )
         if on_stage:
             on_stage(stage)
 
@@ -149,6 +281,13 @@ def extract_document(
     # ----------------------------------------------------
     stage_start = time.time()
     report_stage("ingestion")
+    record_event(
+        "document.render_started",
+        function="render_document",
+        trace_id=trace_id,
+        batch_id=batch_id,
+        details={"file_extension": Path(filename).suffix.lower()},
+    )
 
     try:
         pages = render_document(filename, content)
@@ -161,13 +300,47 @@ def extract_document(
             len(pages),
             time.time() - stage_start,
         )
-    except Exception:
+    except Exception as error:
+        record_event(
+            "document.render_failed",
+            function="render_document",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            status="failed",
+            duration_ms=round((time.time() - stage_start) * 1000),
+            details={"error_type": type(error).__name__},
+        )
         logger.exception("[INGEST] Document rendering failed")
         raise
+    record_event(
+        "document.rendered",
+        function="render_document",
+        trace_id=trace_id,
+        batch_id=batch_id,
+        status="success",
+        duration_ms=round((time.time() - stage_start) * 1000),
+        details={
+            "page_count": len(pages),
+            "render_dpi": 300 if Path(filename).suffix.lower() == ".pdf" else None,
+        },
+    )
 
     if on_page_rendered:
         for page in pages:
             on_page_rendered(page)
+            record_event(
+                "page.preview_ready",
+                function="on_page_rendered",
+                trace_id=trace_id,
+                batch_id=batch_id,
+                page=page.number,
+                status="success",
+                details={
+                    "width": page.width,
+                    "height": page.height,
+                    "image_bytes": len(page.png),
+                },
+            )
 
     extractions: list[FormExtraction] = []
 
@@ -188,16 +361,49 @@ def extract_document(
         # ------------------------------------------------
         report_stage("classification")
         stage_start = time.time()
+        record_event(
+            "page.ocr_started",
+            function="read_ocr",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            page=page.number,
+            details={"ocr_languages": OCR_LANGUAGES},
+        )
 
         try:
             ocr_text = read_ocr(page.png)
-
-            if not isinstance(ocr_text, str) or not ocr_text.strip():
+            ocr_available = isinstance(ocr_text, str) and bool(ocr_text.strip())
+            record_event(
+                "page.ocr_completed",
+                function="read_ocr",
+                trace_id=trace_id,
+                batch_id=batch_id,
+                page=page.number,
+                status="success" if ocr_available else "empty",
+                duration_ms=round((time.time() - stage_start) * 1000),
+                details={
+                    "text_available": ocr_available,
+                    "character_count": len(ocr_text) if isinstance(ocr_text, str) else 0,
+                },
+            )
+            if not ocr_available and EXTRACTION_MODE == "local_ocr_rules":
                 raise ValueError("OCR returned empty text.")
+            if ocr_available:
+                form_type, classifier_confident = classify_form(ocr_text)
+            else:
+                form_type, classifier_confident = FormType.UNKNOWN, False
 
-            form_type, classifier_confident = classify_form(ocr_text)
-
-        except Exception:
+        except Exception as error:
+            record_event(
+                "page.classification_failed",
+                function="classify_form",
+                trace_id=trace_id,
+                batch_id=batch_id,
+                page=page.number,
+                status="failed",
+                duration_ms=round((time.time() - stage_start) * 1000),
+                details={"error_type": type(error).__name__},
+            )
             logger.exception(
                 "[CLASSIFY] OCR or form classification failed; "
                 "page=%d requires manual review",
@@ -205,15 +411,33 @@ def extract_document(
             )
 
             # לא מנחשים סוג טופס ולא שולחים טקסט ריק למודל.
+            fields = _empty_fields()
+            _audit_field_results(
+                fields,
+                trace_id=trace_id,
+                batch_id=batch_id,
+                page=page.number,
+            )
             extractions.append(
-                FormExtraction(
-                    form_type="unknown",
-                    page=page.number,
-                    fields=_empty_fields(),
-                )
+                FormExtraction(form_type="unknown", page=page.number, fields=fields)
             )
             report_stage("manual_review")
             continue
+
+        record_event(
+            "page.classified",
+            function="classify_form",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            page=page.number,
+            status="success" if classifier_confident else "uncertain",
+            duration_ms=round((time.time() - stage_start) * 1000),
+            details={
+                "form_type": form_type.value,
+                "classification_confident": classifier_confident,
+                "ocr_available": ocr_available,
+            },
+        )
 
         logger.info(
             "[CLASSIFY] page=%d; type=%s; confident=%s; "
@@ -226,45 +450,153 @@ def extract_document(
         )
 
         # ------------------------------------------------
-        # Stage 3: Gemini extraction
+        # Stage 3: configurable local, Gemini, or cross-checked extraction
         # ------------------------------------------------
         report_stage("extraction")
         stage_start = time.time()
 
         try:
-            candidate = _get_extractor().extract(
-                page.png,
-                form_type=form_type.value,
-                ocr_text=ocr_text,
-                width=page.width,
-                height=page.height,
-            )
-
-            if not isinstance(candidate.fields, dict):
-                raise ExtractorUnavailableError(
-                    "Gemini returned an invalid extraction structure."
+            provider_results: dict[str, ExtractionCandidate | None] = {
+                "local_ocr_rules": None,
+                "gemini": None,
+            }
+            if EXTRACTION_MODE == "hybrid":
+                providers = (
+                    ("local_ocr_rules", "gemini")
+                    if ocr_available
+                    else ("gemini",)
                 )
+            else:
+                providers = (EXTRACTION_MODE,)
+            provider_errors = []
+            for provider in providers:
+                provider_start = time.time()
+                record_event(
+                    "provider.extraction_started",
+                    function=f"{provider}.extract",
+                    trace_id=trace_id,
+                    batch_id=batch_id,
+                    page=page.number,
+                    details={"provider": provider, "mode": EXTRACTION_MODE},
+                )
+                try:
+                    result = _get_extractor(provider).extract(
+                        page.png,
+                        form_type=form_type.value,
+                        ocr_text=ocr_text,
+                        width=page.width,
+                        height=page.height,
+                    )
+                    if not isinstance(result.fields, dict):
+                        raise ExtractorUnavailableError(
+                            f"{provider} returned an invalid extraction structure."
+                        )
+                    provider_results[provider] = result
+                    found_fields = sorted(
+                        name
+                        for name, field in result.fields.items()
+                        if isinstance(field, dict)
+                        and (
+                            field.get("value") is not None
+                            and field.get("value") != ""
+                            and field.get("value") != []
+                        )
+                    )
+                    record_event(
+                        "provider.extraction_completed",
+                        function=f"{provider}.extract",
+                        trace_id=trace_id,
+                        batch_id=batch_id,
+                        page=page.number,
+                        status="success",
+                        duration_ms=round((time.time() - provider_start) * 1000),
+                        details={
+                            "provider": provider,
+                            "fields_found": found_fields,
+                            "fields_missing": sorted(set(FIELD_NAMES) - set(found_fields)),
+                            "handwritten_fields": sorted(
+                                name
+                                for name, field in result.fields.items()
+                                if isinstance(field, dict)
+                                and field.get("handwritten") is True
+                                and name in FIELD_NAMES
+                            ),
+                        },
+                    )
+                except Exception as error:
+                    record_event(
+                        "provider.extraction_failed",
+                        function=f"{provider}.extract",
+                        trace_id=trace_id,
+                        batch_id=batch_id,
+                        page=page.number,
+                        status="failed",
+                        duration_ms=round((time.time() - provider_start) * 1000),
+                        details={
+                            "provider": provider,
+                            "error_type": type(error).__name__,
+                        },
+                    )
+                    logger.warning(
+                        "[EXTRACT] Provider=%s failed; page=%d; error=%s",
+                        provider,
+                        page.number,
+                        type(error).__name__,
+                    )
+                    provider_errors.append(provider)
+
+            if EXTRACTION_MODE == "hybrid":
+                candidate = _merge_candidates(
+                    provider_results["local_ocr_rules"],
+                    provider_results["gemini"],
+                )
+                if provider_errors:
+                    logger.warning(
+                        "[EXTRACT] Hybrid cross-check incomplete; page=%d; unavailable=%s",
+                        page.number,
+                        ",".join(provider_errors),
+                    )
+            else:
+                candidate = provider_results[EXTRACTION_MODE]
+                if candidate is None:
+                    raise ExtractorUnavailableError(
+                        f"The configured {EXTRACTION_MODE} extraction provider failed."
+                    )
 
             logger.info(
-                "[EXTRACT] page=%d; duration=%.2fs",
+                "[EXTRACT] mode=%s; page=%d; duration=%.2fs",
+                EXTRACTION_MODE,
                 page.number,
                 time.time() - stage_start,
             )
 
-        except Exception:
+        except Exception as error:
+            record_event(
+                "page.extraction_failed",
+                function="extract_document",
+                trace_id=trace_id,
+                batch_id=batch_id,
+                page=page.number,
+                status="failed",
+                duration_ms=round((time.time() - stage_start) * 1000),
+                details={"error_type": type(error).__name__},
+            )
             logger.exception(
-                "[EXTRACT] Gemini extraction failed; "
+                "[EXTRACT] Extraction failed; "
                 "page=%d requires manual review",
                 page.number,
             )
 
-            # אין fallback למודל אחר ואין אישור אוטומטי.
+            # Never auto-approve a failed extraction or silently switch providers.
+            fields = _empty_fields()
+            _audit_field_results(
+                fields,
+                trace_id=trace_id,
+                batch_id=batch_id,
+                page=page.number,
+            )
             extractions.append(
-                FormExtraction(
-                    form_type=form_type.value,
-                    page=page.number,
-                    fields=_empty_fields(),
-                )
+                FormExtraction(form_type=form_type.value, page=page.number, fields=fields)
             )
             report_stage("manual_review")
             continue
@@ -293,7 +625,7 @@ def extract_document(
             )
 
         fields = {}
-        typed_ocr_text = read_ocr(page.png)
+        typed_ocr_text = ocr_text
 
         for name in FIELD_NAMES:
             report_stage("validation")
@@ -309,11 +641,32 @@ def extract_document(
             )
 
             value, handwritten = _normalize_candidate(name, item)
-            field_source = "ocr"
+            engine_agreement = item.get("_engine_agreement")
+            engine_check_incomplete = item.get("_engine_check_incomplete") is True
+            engine_source = item.get("_engine_source", EXTRACTION_MODE)
+            field_source = "vlm" if engine_source == "gemini" else "ocr"
 
             if handwritten and bbox is not None:
+                crop_start = time.time()
                 try:
-                    crop_result = _get_extractor().extract_field_crop(
+                    crop_provider = (
+                        engine_source
+                        if engine_source in {"local_ocr_rules", "gemini"}
+                        else "local_ocr_rules"
+                    )
+                    record_event(
+                        "field.crop_started",
+                        function=f"{crop_provider}.extract_field_crop",
+                        trace_id=trace_id,
+                        batch_id=batch_id,
+                        page=page.number,
+                        details={
+                            "field": name,
+                            "provider": crop_provider,
+                            "bbox_found": True,
+                        },
+                    )
+                    crop_result = _get_extractor(crop_provider).extract_field_crop(
                         page.png,
                         field_name=name,
                         bbox=bbox,
@@ -321,29 +674,70 @@ def extract_document(
                         height=page.height,
                     )
                     if isinstance(crop_result, dict):
-                        value = crop_result.get("value")
-                        raw = crop_result.get("raw")
-                        if isinstance(raw, str):
-                            raw = raw
-                        else:
-                            raw = item.get("raw") if isinstance(item.get("raw"), str) else None
-                        if value is not None and isinstance(value, list):
-                            value = normalize_identifier_list(value) if name in {"center_number", "commitment_number"} else value
-                        if isinstance(value, str):
-                            value = value.strip() or None
-                        if value is None:
-                            value, handwritten = _normalize_candidate(name, item)
-                        field_source = "vlm"
+                        crop_value, crop_handwritten = _normalize_candidate(
+                            name,
+                            crop_result,
+                        )
+                        if crop_value is not None:
+                            value = crop_value
+                            handwritten = handwritten or crop_handwritten
+                            field_source = (
+                                "vlm" if crop_provider == "gemini" else "ocr"
+                            )
+                        crop_raw = crop_result.get("raw")
+                        record_event(
+                            "field.crop_completed",
+                            function=f"{crop_provider}.extract_field_crop",
+                            trace_id=trace_id,
+                            batch_id=batch_id,
+                            page=page.number,
+                            status="found" if crop_value is not None else "empty",
+                            duration_ms=round((time.time() - crop_start) * 1000),
+                            details={
+                                "field": name,
+                                "found": crop_value is not None,
+                                "handwritten": crop_handwritten,
+                            },
+                        )
+                        raw = (
+                            crop_raw
+                            if isinstance(crop_raw, str)
+                            else item.get("raw")
+                            if isinstance(item.get("raw"), str)
+                            else None
+                        )
                     else:
-                        field_source = "ocr"
-                except Exception:
+                        record_event(
+                            "field.crop_completed",
+                            function=f"{crop_provider}.extract_field_crop",
+                            trace_id=trace_id,
+                            batch_id=batch_id,
+                            page=page.number,
+                            status="empty",
+                            duration_ms=round((time.time() - crop_start) * 1000),
+                            details={"field": name, "found": False},
+                        )
+                except Exception as error:
+                    record_event(
+                        "field.crop_failed",
+                        function="extract_field_crop",
+                        trace_id=trace_id,
+                        batch_id=batch_id,
+                        page=page.number,
+                        status="failed",
+                        duration_ms=round((time.time() - crop_start) * 1000),
+                        details={
+                            "field": name,
+                            "error_type": type(error).__name__,
+                        },
+                    )
                     logger.exception(
                         "[CROP] Failed to inspect handwritten field=%s page=%d",
                         name,
                         page.number,
                     )
                     value, handwritten = _normalize_candidate(name, item)
-                    field_source = "ocr"
+                    raw = item.get("raw") if isinstance(item.get("raw"), str) else None
             else:
                 raw = item.get("raw")
                 if not isinstance(raw, str):
@@ -351,9 +745,6 @@ def extract_document(
 
             if not handwritten:
                 value, _ = _normalize_candidate(name, item)
-                raw = item.get("raw") if isinstance(item.get("raw"), str) else None
-
-            if handwritten and field_source == "vlm":
                 raw = item.get("raw") if isinstance(item.get("raw"), str) else None
 
             try:
@@ -368,6 +759,13 @@ def extract_document(
                     form_type=form_type.value,
                     health_fund=health_fund_value,
                 )
+                if engine_agreement is not None:
+                    signals["engine_agreement"] = engine_agreement
+                if engine_check_incomplete:
+                    signals["engine_check_incomplete"] = True
+                if engine_agreement is False or engine_check_incomplete:
+                    state = "orange"
+                    confidence = min(confidence, 0.5)
             except Exception:
                 logger.exception(
                     "[VALIDATION] Validation failed for field=%s "
@@ -378,7 +776,7 @@ def extract_document(
 
                 state = "orange"
                 confidence = 0.0
-                signals = ["validation_failed"]
+                signals = {"validation_failed": True}
 
             # Do not log patient data or extracted field values.
             logger.info(
@@ -404,6 +802,29 @@ def extract_document(
                 source=field_source,
             )
 
+        _audit_field_results(
+            fields,
+            trace_id=trace_id,
+            batch_id=batch_id,
+            page=page.number,
+        )
+        record_event(
+            "page.validation_completed",
+            function="evaluate_field",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            page=page.number,
+            status="success",
+            duration_ms=round((time.time() - stage_start) * 1000),
+            details={
+                "fields_found": sum(field.value is not None for field in fields.values()),
+                "fields_missing": sum(field.value is None for field in fields.values()),
+                "fields_needing_review": sum(
+                    field.needs_review for field in fields.values()
+                ),
+            },
+        )
+
         logger.info(
             "[VALIDATION] page=%d; duration=%.2fs",
             page.number,
@@ -426,11 +847,30 @@ def extract_document(
             page.number,
             time.time() - page_start_time,
         )
+        record_event(
+            "page.processing_completed",
+            function="extract_document",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            page=page.number,
+            status="success",
+            duration_ms=round((time.time() - page_start_time) * 1000),
+            details={"form_type": form_type.value},
+        )
 
     logger.info(
         "[PIPELINE COMPLETE] pages=%d; duration=%.2fs",
         len(pages),
         time.time() - pipeline_start_time,
+    )
+    record_event(
+        "document.processing_completed",
+        function="extract_document",
+        trace_id=trace_id,
+        batch_id=batch_id,
+        status="success",
+        duration_ms=round((time.time() - pipeline_start_time) * 1000),
+        details={"page_count": len(pages), "form_count": len(extractions)},
     )
 
     return extractions

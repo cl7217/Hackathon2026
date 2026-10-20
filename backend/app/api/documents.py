@@ -17,6 +17,7 @@ from app.config import (
 from app.pipeline.extractor import ExtractorUnavailableError
 from app.pipeline.ingest import InvalidDocumentError
 from app.pipeline.process import extract_document
+from app.services.audit import read_events, record_event
 from app.services.database import (
     approve_document,
     create_batch,
@@ -57,8 +58,25 @@ def read_root() -> dict[str, str]:
 @router.post("/api/extract/")
 async def extract_document_endpoint(file: UploadFile = File(...)) -> dict:
     filename = _safe_filename(file.filename)
+    trace_id = str(uuid.uuid4())
     content = await file.read(MAX_UPLOAD_BYTES + 1)
+    record_event(
+        "upload.received",
+        function="extract_document_endpoint",
+        trace_id=trace_id,
+        details={
+            "file_extension": Path(filename).suffix.lower(),
+            "file_bytes": len(content),
+        },
+    )
     if len(content) > MAX_UPLOAD_BYTES:
+        record_event(
+            "upload.rejected",
+            function="extract_document_endpoint",
+            trace_id=trace_id,
+            status="failed",
+            details={"reason": "file_too_large"},
+        )
         raise HTTPException(status_code=413, detail="קובץ חורג ממגבלת 20MB.")
     try:
         rendered_pages = []
@@ -67,14 +85,70 @@ async def extract_document_endpoint(file: UploadFile = File(...)) -> dict:
             filename,
             content,
             on_page_rendered=rendered_pages.append,
+            trace_id=trace_id,
+        )
+        record_event(
+            "document.persistence_started",
+            function="save_extraction",
+            trace_id=trace_id,
+            details={"form_count": len(extractions)},
         )
         batch_id, document_id = await run_in_threadpool(save_extraction, filename, extractions)
+        record_event(
+            "document.persisted",
+            function="save_extraction",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            document_id=document_id,
+            status="success",
+            details={"form_count": len(extractions)},
+        )
+        preview_start = time.perf_counter()
         cache_document_pages(document_id, rendered_pages)
+        record_event(
+            "document.preview_cached",
+            function="cache_document_pages",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            document_id=document_id,
+            status="success",
+            duration_ms=round((time.perf_counter() - preview_start) * 1000),
+            details={"page_count": len(rendered_pages)},
+        )
+        record_event(
+            "document.completed",
+            function="extract_document_endpoint",
+            trace_id=trace_id,
+            batch_id=batch_id,
+            document_id=document_id,
+            status="success",
+        )
     except InvalidDocumentError as error:
+        record_event(
+            "document.failed",
+            function="extract_document_endpoint",
+            trace_id=trace_id,
+            status="failed",
+            details={"error_type": type(error).__name__},
+        )
         raise HTTPException(status_code=400, detail=str(error)) from error
     except ExtractorUnavailableError as error:
+        record_event(
+            "document.failed",
+            function="extract_document_endpoint",
+            trace_id=trace_id,
+            status="failed",
+            details={"error_type": type(error).__name__},
+        )
         raise HTTPException(status_code=503, detail=str(error)) from error
     except Exception as error:
+        record_event(
+            "document.failed",
+            function="extract_document_endpoint",
+            trace_id=trace_id,
+            status="failed",
+            details={"error_type": type(error).__name__},
+        )
         raise HTTPException(status_code=500, detail="אירעה שגיאה בעיבוד המסמך.") from error
 
     first = extractions[0]
@@ -95,37 +169,127 @@ async def create_extraction_batch(
     files: list[UploadFile] = File(...),
 ) -> dict[str, str]:
     if not files:
+        record_event(
+            "batch.upload_rejected",
+            function="create_extraction_batch",
+            status="failed",
+            details={"reason": "no_files"},
+        )
         raise HTTPException(status_code=400, detail="יש לבחור לפחות קובץ אחד.")
     if len(files) > MAX_BATCH_FILES:
+        record_event(
+            "batch.upload_rejected",
+            function="create_extraction_batch",
+            status="failed",
+            details={"reason": "too_many_files", "file_count": len(files)},
+        )
         raise HTTPException(status_code=413, detail="אצווה יכולה להכיל עד 50 קבצים.")
     contents = []
     total_size = 0
-    for upload in files:
+    for index, upload in enumerate(files, start=1):
         filename = _safe_filename(upload.filename)
+        trace_id = str(uuid.uuid4())
         content = await upload.read(MAX_UPLOAD_BYTES + 1)
+        record_event(
+            "upload.file_received",
+            function="create_extraction_batch",
+            trace_id=trace_id,
+            details={
+                "file_index": index,
+                "file_extension": Path(filename).suffix.lower(),
+                "file_bytes": len(content),
+            },
+        )
         total_size += len(content)
         if len(content) > MAX_UPLOAD_BYTES:
+            record_event(
+                "upload.file_rejected",
+                function="create_extraction_batch",
+                trace_id=trace_id,
+                status="failed",
+                details={"reason": "file_too_large"},
+            )
             raise HTTPException(status_code=413, detail="קובץ חורג ממגבלת 20MB.")
         if total_size > MAX_BATCH_BYTES:
+            record_event(
+                "upload.file_rejected",
+                function="create_extraction_batch",
+                trace_id=trace_id,
+                status="failed",
+                details={"reason": "batch_too_large"},
+            )
             raise HTTPException(status_code=413, detail="האצווה חורגת ממגבלת 100MB.")
-        contents.append((filename, content))
+        contents.append((filename, content, trace_id))
 
     batch_id = create_batch()
+    record_event(
+        "batch.created",
+        function="create_batch",
+        batch_id=batch_id,
+        status="queued",
+        details={"document_count": len(contents)},
+    )
     batch_dir = DATA_DIR / "queue"
     uploads = []
     try:
         batch_dir.mkdir(parents=True, exist_ok=True)
-        for filename, content in contents:
+        for index, (filename, content, trace_id) in enumerate(contents, start=1):
             temporary_path = batch_dir / f"{uuid.uuid4()}.upload"
-            uploads.append((filename, str(temporary_path)))
+            uploads.append((filename, str(temporary_path), trace_id))
             temporary_path.write_bytes(content)
+            record_event(
+                "queue.file_saved",
+                function="Path.write_bytes",
+                trace_id=trace_id,
+                batch_id=batch_id,
+                status="success",
+                details={"file_index": index, "file_bytes": len(content)},
+            )
     except OSError as error:
-        for _, temporary_path in uploads:
+        for _, temporary_path, trace_id in uploads:
             Path(temporary_path).unlink(missing_ok=True)
+            record_event(
+                "queue.file_cleanup",
+                function="Path.unlink",
+                trace_id=trace_id,
+                batch_id=batch_id,
+                status="success",
+                details={"file_removed": True, "reason": "queue_write_failed"},
+            )
         update_batch_status(batch_id, "failed")
+        record_event(
+            "batch.queue_failed",
+            function="Path.write_bytes",
+            batch_id=batch_id,
+            status="failed",
+            details={"error_type": type(error).__name__},
+        )
         raise HTTPException(status_code=500, detail="לא ניתן לשמור את קובצי האצווה לעיבוד.") from error
+    record_event(
+        "batch.queued",
+        function="BackgroundTasks.add_task",
+        batch_id=batch_id,
+        status="queued",
+        details={"document_count": len(uploads)},
+    )
     background_tasks.add_task(process_batch, batch_id, uploads)
     return {"batch_id": batch_id, "status": "queued"}
+
+
+@router.get("/api/logs")
+def get_audit_events(
+    batch_id: str | None = Query(default=None, max_length=64),
+    trace_id: str | None = Query(default=None, max_length=64),
+    document_id: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=200, ge=1, le=500),
+) -> dict:
+    events = read_events(
+        limit=limit,
+        batch_id=batch_id,
+        trace_id=trace_id,
+        document_id=document_id,
+    )
+    return {"events": events, "count": len(events)}
 
 
 @router.get("/api/batches/{batch_id}")
@@ -180,6 +344,14 @@ def update_field(
         raise HTTPException(status_code=400, detail="שם השדה אינו נתמך.")
     if not correct_field(document_id, field_name, correction.value, page):
         raise HTTPException(status_code=404, detail="המסמך או השדה לא נמצאו.")
+    record_event(
+        "field.corrected",
+        function="correct_field",
+        document_id=document_id,
+        page=page,
+        status="success",
+        details={"field": field_name},
+    )
     return {"updated": True}
 
 
@@ -195,6 +367,14 @@ def update_fields(document_id: str, correction: FieldsCorrection) -> dict[str, l
         if not correct_field(document_id, field_name, value, correction.page):
             raise HTTPException(status_code=404, detail=f"השדה {field_name} לא נמצא.")
         updated.append(field_name)
+    record_event(
+        "fields.corrected",
+        function="correct_field",
+        document_id=document_id,
+        page=correction.page,
+        status="success",
+        details={"fields": sorted(updated)},
+    )
     return {"updated": updated}
 
 
@@ -204,6 +384,14 @@ def mark_field_reviewed(
 ) -> dict[str, bool]:
     if not review_field(document_id, field_name, page):
         raise HTTPException(status_code=404, detail="המסמך או השדה לא נמצאו.")
+    record_event(
+        "field.reviewed_by_user",
+        function="review_field",
+        document_id=document_id,
+        page=page,
+        status="success",
+        details={"field": field_name},
+    )
     return {"reviewed": True}
 
 
@@ -216,6 +404,13 @@ def approve(
         raise HTTPException(status_code=404, detail="המסמך לא נמצא.")
     if not approved:
         raise HTTPException(status_code=409, detail="יש לבדוק את כל השדות לפני אישור המסמך.")
+    record_event(
+        "document.approved",
+        function="approve_document",
+        document_id=document_id,
+        page=page,
+        status="success",
+    )
     return {"approved": True}
 
 
@@ -223,12 +418,25 @@ def approve(
 def delete_form(document_id: str, page: int = Query(ge=1)) -> dict[str, bool]:
     if not delete_document_form(document_id, page):
         raise HTTPException(status_code=404, detail="המסמך או העמוד לא נמצאו.")
+    record_event(
+        "document.form_deleted",
+        function="delete_document_form",
+        document_id=document_id,
+        page=page,
+        status="success",
+    )
     return {"deleted": True}
 
 
 @router.get("/api/export.xlsx")
 def export_approved(document_ids: list[str] = Query(..., min_length=1)):
     workbook = build_approved_workbook(document_ids)
+    record_event(
+        "approved_records.exported",
+        function="build_approved_workbook",
+        status="success",
+        details={"document_count": len(set(document_ids))},
+    )
     return StreamingResponse(
         workbook,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

@@ -22,3 +22,13 @@ class Extractor(Protocol):
         width: int,
         height: int,
     ) -> ExtractionCandidate: ...
+
+    def extract_field_crop(
+        self,
+        image: bytes,
+        *,
+        field_name: str,
+        bbox: list[int],
+        width: int,
+        height: int,
+    ) -> dict: ...

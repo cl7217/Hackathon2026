@@ -35,7 +35,7 @@ export default function ExtractedDataForm({
               key={field.key}
               className={`rounded-xl border p-3.5 ${
                 selectedField === field.key
-                  ? 'border-blue-300 ring-2 ring-blue-100'
+                  ? 'border-teal-300 ring-2 ring-teal-100'
                   : needsReview
                     ? 'border-amber-200 bg-amber-50/70'
                     : 'border-slate-200 bg-white'
@@ -45,7 +45,7 @@ export default function ExtractedDataForm({
                 <button
                   type="button"
                   onClick={() => onSelectField(field.key)}
-                  className="text-right text-xs font-semibold text-slate-700 hover:text-blue-700"
+                  className="text-right text-xs font-semibold text-slate-700 hover:text-teal-800"
                 >
                   {field.label}
                   {meta.handwritten && <span className="mr-1 font-normal text-slate-400">· כתב יד</span>}
@@ -61,7 +61,7 @@ export default function ExtractedDataForm({
                   onChange={(event) => onChange(field, event.target.value)}
                   onBlur={() => onBlur(field)}
                   aria-label={field.label}
-                  className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-800 outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+                  className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-800 outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
                   placeholder="לא זוהה — ניתן להזין ידנית"
                 />
                 {needsReview && (

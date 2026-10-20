@@ -43,7 +43,33 @@ def sender_is_allowed(value: str) -> bool:
     if not candidate:
         return False
     allowed_values = {_compact(allowed) for allowed in SENDER_ALLOWLIST}
-    return candidate in allowed_values
+    health_funds = {_compact(name) for name in HEALTH_FUND_NAMES}
+    hospital_names = allowed_values - health_funds - {_compact("בית חולים")}
+    return any(
+        allowed in candidate
+        or (candidate in allowed and len(candidate) >= 4)
+        for allowed in hospital_names
+    ) or any(fund in candidate for fund in health_funds) or (
+        _compact("בית חולים") in candidate and len(candidate) > len(_compact("בית חולים"))
+    )
+
+
+def health_fund_is_allowed(value: str) -> bool:
+    candidate = _compact(value)
+    return bool(candidate) and any(
+        _compact(name) in candidate for name in HEALTH_FUND_NAMES
+    )
+
+
+def _numeric_identifiers(value: str | list[str]) -> list[str]:
+    values = value if isinstance(value, list) else [value]
+    normalized = []
+    for item in values:
+        candidate = str(item).strip()
+        if not re.fullmatch(r"\d+(?:[\s./-]\d+)*", candidate):
+            return []
+        normalized.append(re.sub(r"\D", "", candidate))
+    return normalized
 
 
 def validate_user_value(
@@ -65,13 +91,22 @@ def validate_user_value(
             re.fullmatch(r"[A-Za-z\u0590-\u05FF][A-Za-z\u0590-\u05FF '’-]{0,79}", candidate)
         )
     elif name in {"sender", "health_fund"}:
-        signals["field_valid"] = sender_is_allowed(candidate)
+        signals["field_valid"] = (
+            health_fund_is_allowed(candidate)
+            if name == "health_fund"
+            else sender_is_allowed(candidate)
+        )
+    elif name == "received_stamp":
+        signals["field_valid"] = "התקבל" in _compact(candidate)
+    elif name == "center_number":
+        signals["numeric_format"] = bool(_numeric_identifiers(value))
     elif name == "commitment_number":
         prefix = commitment_prefix(form_type, health_fund)
+        identifiers = _numeric_identifiers(value)
+        signals["numeric_format"] = bool(identifiers)
         if prefix:
-            values = value if isinstance(value, list) else [value]
-            signals["commitment_prefix_match"] = bool(values) and all(
-                re.sub(r"\D", "", item).startswith(prefix) for item in values
+            signals["commitment_prefix_match"] = bool(identifiers) and all(
+                item.startswith(prefix) for item in identifiers
             )
     confidence = 1.0 if all(signals.values()) else 0.5
     state = "green" if all(signals.values()) else "orange"
@@ -114,14 +149,19 @@ def evaluate_field(
             re.fullmatch(r"[A-Za-z\u0590-\u05FF][A-Za-z\u0590-\u05FF '’-]{0,79}", candidate)
         )
     elif name == "health_fund":
-        signals["field_valid"] = sender_is_allowed(candidate)
+        signals["field_valid"] = health_fund_is_allowed(candidate)
+    elif name == "received_stamp":
+        signals["field_valid"] = "התקבל" in _compact(candidate)
+    elif name == "center_number":
+        signals["numeric_format"] = bool(_numeric_identifiers(value))
     elif name == "commitment_number":
         prefix = commitment_prefix(form_type or "", health_fund)
+        identifiers = _numeric_identifiers(value)
+        signals["numeric_format"] = bool(identifiers)
         if prefix:
-            commitment_values = value if isinstance(value, list) else [value]
-            signals["commitment_prefix_match"] = bool(commitment_values) and all(
-                re.sub(r"\D", "", item).startswith(prefix)
-                for item in commitment_values
+            signals["commitment_prefix_match"] = bool(identifiers) and all(
+                item.startswith(prefix)
+                for item in identifiers
             )
 
     confidence = round(sum(signals.values()) / len(signals), 2)

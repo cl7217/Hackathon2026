@@ -18,7 +18,6 @@ import {
   Upload,
   X,
 } from 'lucide-react'
-import * as XLSX from '@e965/xlsx'
 import DocumentViewer from './components/DocumentViewer'
 import ExtractedDataForm from './components/ExtractedDataForm'
 import LivePipelineStepper from './components/LivePipelineStepper'
@@ -29,6 +28,14 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024
 const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8001').replace(/\/$/, '')
 const EXTRACT_ENDPOINT = import.meta.env.VITE_EXTRACT_ENDPOINT || '/extract'
 const CONFIDENCE_THRESHOLD = 0.75
+const HEALTH_FUND_PREFIXES = { clalit: '30', leumit: '12', meuhedet: '73', maccabi: '26' }
+const HEALTH_FUND_NAMES = ['כללית', 'מכבי', 'מאוחדת', 'לאומית']
+const SENDER_NAMES = [
+  ...HEALTH_FUND_NAMES,
+  'בית חולים', 'הדסה', 'שיבא', 'איכילוב', 'רמב״ם', 'רמבם', 'סורוקה',
+  'בילינסון', 'שערי צדק', 'וולפסון', 'קפלן', 'אסף הרופא', 'ברזילי',
+  'הלל יפה', 'זיו', 'פוריה', 'לניאדו', 'מעייני הישועה',
+]
 
 const RESULT_FIELDS = [
   { key: 'firstName', label: 'שם פרטי', aliases: ['first_name', 'patient_first_name', 'patientFirstName', 'firstName'] },
@@ -48,6 +55,33 @@ function formatFileSize(bytes) {
     : `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const link = window.document.createElement('a')
+  link.href = url
+  link.download = filename
+  window.document.body.appendChild(link)
+  link.click()
+  link.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+async function downloadSpreadsheet(rows, filename) {
+  const XLSX = await import('@e965/xlsx')
+  const worksheet = XLSX.utils.json_to_sheet(rows)
+  worksheet['!cols'] = Object.keys(rows[0] || {}).map((key) => ({
+    wch: Math.min(Math.max(key.length + 4, 16), 36),
+  }))
+  worksheet['!views'] = [{ rightToLeft: true }]
+  const workbook = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'טפסים מאושרים')
+  const content = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' })
+  downloadBlob(
+    new Blob([content], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+    filename,
+  )
+}
+
 function getFieldValue(source) {
   if (source === true) return 'כן'
   if (source === false) return 'לא'
@@ -63,6 +97,8 @@ function getFieldValue(source) {
 
 function validateEditedField(field, value, formType, healthFund) {
   if (!value.trim()) return { state: 'empty', needsReview: true }
+  const compact = (input) => input.toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '')
+  const values = value.split(/[,;\n]+/).map((item) => item.trim()).filter(Boolean)
   if (field.key === 'idNumber') {
     const id = value.replace(/\D/g, '').padStart(9, '0')
     const valid = /^\d{9}$/.test(id) && [...id].reduce((sum, digit, index) => {
@@ -75,17 +111,69 @@ function validateEditedField(field, value, formType, healthFund) {
       signals: { field_valid: valid },
     }
   }
-  if (field.key === 'commitmentNumber') {
-    const prefixes = { clalit: '30', leumit: '12', meuhedet: '73', maccabi: '26' }
-    const fundToIssuer = { כללית: 'clalit', מכבי: 'maccabi', מאוחדת: 'meuhedet', לאומית: 'leumit' }
-    const matchedFund = Object.entries(fundToIssuer).find(([name]) => String(healthFund || '').includes(name))?.[1]
-    const prefix = prefixes[formType] || prefixes[matchedFund]
-    const values = value.split(/[,;\n]+/).map((item) => item.replace(/\D/g, '')).filter(Boolean)
-    const valid = values.length > 0 && (!prefix || values.every((item) => item.startsWith(prefix)))
+  if (field.key === 'centerNumber') {
+    const valid = values.length > 0 && values.every((item) => /^\d+(?:[\s./-]\d+)*$/.test(item))
     return {
       state: valid ? 'green' : 'orange',
       needsReview: !valid,
-      signals: { commitment_prefix_match: valid },
+      signals: { numeric_format: valid },
+    }
+  }
+  if (field.key === 'documentDate') {
+    const match = value.trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/)
+    const parsed = match
+      ? new Date(Number(match[3]), Number(match[2]) - 1, Number(match[1]))
+      : null
+    const valid = Boolean(
+      match &&
+      parsed.getFullYear() === Number(match[3]) &&
+      parsed.getMonth() === Number(match[2]) - 1 &&
+      parsed.getDate() === Number(match[1]) &&
+      parsed.getFullYear() >= 1900 &&
+      parsed <= new Date(),
+    )
+    return {
+      state: valid ? 'green' : 'orange',
+      needsReview: !valid,
+      signals: { field_valid: valid },
+    }
+  }
+  if (field.key === 'sender' || field.key === 'healthFund') {
+    const candidate = compact(value)
+    const allowed = (field.key === 'healthFund' ? HEALTH_FUND_NAMES : SENDER_NAMES)
+      .some((name) => candidate.includes(compact(name)))
+    return {
+      state: allowed ? 'green' : 'orange',
+      needsReview: !allowed,
+      signals: { field_valid: allowed },
+    }
+  }
+  if (field.key === 'receivedStamp') {
+    const valid = compact(value).includes(compact('התקבל'))
+    return {
+      state: valid ? 'green' : 'orange',
+      needsReview: !valid,
+      signals: { field_valid: valid },
+    }
+  }
+  if (field.key === 'commitmentNumber') {
+    const fundToIssuer = { כללית: 'clalit', מכבי: 'maccabi', מאוחדת: 'meuhedet', לאומית: 'leumit' }
+    const matchedFund = Object.entries(fundToIssuer).find(([name]) => String(healthFund || '').includes(name))?.[1]
+    const prefix = HEALTH_FUND_PREFIXES[formType] || HEALTH_FUND_PREFIXES[matchedFund]
+    const numeric = values.length > 0 && values.every((item) => /^\d+(?:[\s./-]\d+)*$/.test(item))
+    const valid = numeric && (!prefix || values.every((item) => item.replace(/\D/g, '').startsWith(prefix)))
+    return {
+      state: valid ? 'green' : 'orange',
+      needsReview: !valid,
+      signals: { numeric_format: numeric, commitment_prefix_match: valid },
+    }
+  }
+  if (field.key === 'firstName' || field.key === 'lastName') {
+    const valid = /^[A-Za-z\u0590-\u05FF][A-Za-z\u0590-\u05FF '’-]{0,79}$/.test(value.trim())
+    return {
+      state: valid ? 'green' : 'orange',
+      needsReview: !valid,
+      signals: { field_valid: valid },
     }
   }
   return { state: 'green', needsReview: false }
@@ -191,7 +279,9 @@ function App() {
         setRecordsTotal(result.total || 0)
       } catch (error) {
         if (error.name !== 'AbortError') {
-          setRecordsError(error.message || 'לא ניתן לטעון את הרשומות השמורות.')
+          setRecordsError(error instanceof TypeError
+            ? 'לא ניתן להתחבר לשירות. הרשומות השמורות אינן זמינות כרגע.'
+            : error.message || 'לא ניתן לטעון את הרשומות השמורות.')
         }
       } finally {
         if (!controller.signal.aborted) setRecordsLoading(false)
@@ -576,28 +666,31 @@ function App() {
     setUploadError('')
     try {
       const documentIds = [...new Set(approved.map((document) => document.documentId).filter(Boolean))]
-      if (documentIds.length === approved.length) {
+      if (documentIds.length && approved.every((document) => document.documentId)) {
         const query = new URLSearchParams()
         documentIds.forEach((documentId) => query.append('document_ids', documentId))
         const response = await fetch(`${API_BASE_URL}/api/export.xlsx?${query}`)
         if (!response.ok) throw new Error('ייצוא הטפסים שאושרו מהשרת נכשל.')
-        const downloadUrl = URL.createObjectURL(await response.blob())
-        const link = window.document.createElement('a')
-        link.href = downloadUrl
-        link.download = 'טפסים-מאושרים.xlsx'
-        link.click()
-        URL.revokeObjectURL(downloadUrl)
+        downloadBlob(await response.blob(), 'טפסים-מאושרים.xlsx')
       } else {
-        const XLSX = await import('@e965/xlsx')
-        const rows = approved.map((document) => ({
-          'שם הקובץ': document.file.name,
-          ...Object.fromEntries(RESULT_FIELDS.map((field) => [field.label, document.values[field.key] || ''])),
-        }))
-        const worksheet = XLSX.utils.json_to_sheet(rows)
-        worksheet['!cols'] = [{ wch: 32 }, ...RESULT_FIELDS.map(() => ({ wch: 20 }))]
-        const workbook = XLSX.utils.book_new()
-        XLSX.utils.book_append_sheet(workbook, worksheet, 'טפסים מאושרים')
-        XLSX.writeFile(workbook, 'טפסים-מאושרים.xlsx')
+        const rows = approved.flatMap((document) => {
+          const commitments = document.values.commitmentNumber
+            .split(/[,;\n]+/)
+            .map((value) => value.trim())
+            .filter(Boolean)
+          return (commitments.length ? commitments : ['']).map((commitment) => ({
+            'שם הקובץ': document.file.name,
+            'עמוד': document.page || '',
+            'סוג טופס': document.formType || '',
+            ...Object.fromEntries(RESULT_FIELDS.map((field) => [
+              field.label,
+              field.key === 'commitmentNumber'
+                ? commitment
+                : document.values[field.key] || '',
+            ])),
+          }))
+        })
+        await downloadSpreadsheet(rows, 'טפסים-מאושרים.xlsx')
       }
     } catch (exportError) {
       setUploadError(`ייצוא לאקסל נכשל: ${exportError.message || 'נסו שוב.'}`)
@@ -607,22 +700,55 @@ function App() {
   }
 
   async function exportSavedRecords() {
-    const approvedRecords = records.filter((record) => record.approved)
-    const documentIds = [...new Set(approvedRecords.map((record) => record.document_id))]
-    if (!documentIds.length) return
     setIsExporting(true)
     setUploadError('')
     try {
-      const query = new URLSearchParams()
-      documentIds.forEach((documentId) => query.append('document_ids', documentId))
-      const response = await fetch(`${API_BASE_URL}/api/export.xlsx?${query}`)
-      if (!response.ok) throw new Error('ייצוא הרשומות המאושרות נכשל.')
-      const downloadUrl = URL.createObjectURL(await response.blob())
-      const link = window.document.createElement('a')
-      link.href = downloadUrl
-      link.download = 'טפסים-מאושרים.xlsx'
-      link.click()
-      URL.revokeObjectURL(downloadUrl)
+      const approvedRecords = []
+      let offset = 0
+      let total = 0
+      do {
+        const query = new URLSearchParams({
+          approved: 'true',
+          limit: '200',
+          offset: String(offset),
+        })
+        const response = await fetch(`${API_BASE_URL}/api/records?${query}`)
+        if (!response.ok) throw new Error('לא ניתן לטעון את כל הרשומות שאושרו לייצוא.')
+        const result = await response.json()
+        approvedRecords.push(...(result.records || []))
+        total = Number(result.total) || 0
+        offset += 200
+      } while (offset < total && offset > 0)
+
+      if (!approvedRecords.length) throw new Error('לא נמצאו רשומות מאושרות לייצוא.')
+      const documentIds = [...new Set(approvedRecords.map((record) => record.document_id).filter(Boolean))]
+      if (documentIds.length && approvedRecords.every((record) => record.document_id)) {
+        const exportQuery = new URLSearchParams()
+        documentIds.forEach((documentId) => exportQuery.append('document_ids', documentId))
+        const response = await fetch(`${API_BASE_URL}/api/export.xlsx?${exportQuery}`)
+        if (!response.ok) throw new Error('ייצוא הרשומות המאושרות נכשל.')
+        downloadBlob(await response.blob(), 'טפסים-מאושרים.xlsx')
+      } else {
+        const rows = approvedRecords.flatMap((record) => {
+          const values = Object.fromEntries((record.fields || []).map((field) => [field.name, field.value]))
+          const commitments = values.commitment_number
+          const commitmentList = Array.isArray(commitments)
+            ? commitments.map(String).filter(Boolean)
+            : getFieldValue(commitments).split(/[,;\n]+/).map((value) => value.trim()).filter(Boolean)
+          return (commitmentList.length ? commitmentList : ['']).map((commitment) => ({
+            'שם הקובץ': record.filename,
+            'עמוד': record.page || '',
+            'סוג טופס': record.form_type || '',
+            ...Object.fromEntries(RESULT_FIELDS.map((field) => [
+              field.label,
+              field.key === 'commitmentNumber'
+                ? commitment
+                : getFieldValue(values[field.aliases[0]]),
+            ])),
+          }))
+        })
+        await downloadSpreadsheet(rows, 'טפסים-מאושרים.xlsx')
+      }
     } catch (error) {
       setUploadError(error.message || 'לא ניתן לייצא את הרשומות.')
     } finally {
@@ -631,20 +757,20 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-[#f6f9fc]">
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-[420px] bg-gradient-to-b from-[#eaf5fc] via-[#f1f8fc] to-transparent" />
+    <div className="min-h-screen bg-[#f4f8f8]">
+      <div className="pointer-events-none absolute inset-x-0 top-0 h-[420px] bg-gradient-to-b from-[#e5f3f3] via-[#f0f7f7] to-transparent" />
 
       <header className="relative border-b border-slate-200/80 bg-white/70">
         <div className="mx-auto flex h-[76px] max-w-7xl items-center justify-between px-5 sm:px-8">
           <a href="#" className="flex items-center gap-3" aria-label="MedExtract - דף הבית">
-            <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#e6f3fb] text-[#2776a8]">
+            <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-[#e5f3f3] text-[#007c86]">
               <HeartPulse size={22} strokeWidth={2.2} />
             </span>
             <span className="text-[17px] font-extrabold tracking-tight text-[#15324e]">
-              Med<span className="text-[#3987b6]">Extract</span>
+              Med<span className="text-[#008c95]">Extract</span>
             </span>
           </a>
-          <div className="hidden items-center gap-2 rounded-full border border-[#dce9f0] bg-white px-3.5 py-2 text-xs font-medium text-slate-500 sm:flex">
+          <div className="hidden items-center gap-2 rounded-full border border-[#d7e8e8] bg-white px-3.5 py-2 text-xs font-medium text-slate-500 sm:flex">
             <LockKeyhole size={14} className="text-[#4b8b71]" />
             המסמכים מעובדים באופן מאובטח
           </div>
@@ -656,13 +782,13 @@ function App() {
 
       <main className="relative mx-auto max-w-7xl px-5 pb-16 pt-10 sm:px-8 sm:pt-14">
         <section className="mx-auto max-w-2xl text-center">
-          <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-[#dcebf4] bg-white/80 px-3.5 py-1.5 text-xs font-semibold text-[#4680a2] shadow-sm">
+          <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-[#d2e8e7] bg-white/80 px-3.5 py-1.5 text-xs font-semibold text-[#007c86] shadow-sm">
             <Sparkles size={14} />
             חילוץ ובדיקת מסמכים רפואיים
           </div>
-          <h1 className="text-3xl font-extrabold leading-tight tracking-tight text-[#17344f] sm:text-[42px]">
+          <h1 className="text-3xl font-extrabold leading-tight tracking-tight text-[#173a4a] sm:text-[42px]">
             טפסים מסודרים,
-            <span className="text-[#3987b6]"> בלי הקלדה מיותרת</span>
+            <span className="text-[#008c95]"> בלי הקלדה מיותרת</span>
           </h1>
           <p className="mx-auto mt-4 max-w-xl text-[15px] leading-7 text-slate-500 sm:text-base">
             העלו כמה טפסים יחד, בדקו שדות לא ודאיים, ערכו ואשרו לפני הייצוא לאקסל.
@@ -672,7 +798,7 @@ function App() {
         <section className="mx-auto mt-9 max-w-4xl overflow-hidden rounded-2xl border border-slate-200/90 bg-white shadow-card sm:mt-11">
           <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4 sm:px-7">
             <div className="flex items-center gap-3">
-              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#eef7fc] text-[#4389b4]">
+              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-[#edf6f5] text-[#00828a]">
                 <FileText size={18} />
               </span>
               <div>
@@ -700,8 +826,8 @@ function App() {
               type="button"
               className={`group flex min-h-[176px] w-full flex-col items-center justify-center rounded-xl border-2 border-dashed px-5 text-center transition-colors ${
                 isDragging
-                  ? 'border-[#4a9ac6] bg-[#eef8fd]'
-                  : 'border-[#d7e4ec] bg-[#fbfdfe] hover:border-[#8dbbd4] hover:bg-[#f7fbfd]'
+                  ? 'border-[#008c95] bg-[#e8f5f4]'
+                  : 'border-[#d4e4e3] bg-[#fbfdfd] hover:border-[#81bfc0] hover:bg-[#f4f9f8]'
               }`}
               onClick={() => inputRef.current?.click()}
               onDragOver={(event) => {
@@ -715,7 +841,7 @@ function App() {
                 addFiles(event.dataTransfer.files)
               }}
             >
-              <span className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-[#eaf5fb] text-[#4d94bc] transition-transform group-hover:-translate-y-0.5">
+              <span className="mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-[#e8f5f4] text-[#008c95] transition-transform group-hover:-translate-y-0.5">
                 <Upload size={22} strokeWidth={1.8} />
               </span>
               <span className="text-[15px] font-bold text-slate-700">גררו לכאן כמה טפסים</span>
@@ -738,7 +864,7 @@ function App() {
                 type="button"
                 disabled={!pendingCount || isProcessing}
                 onClick={extractDocuments}
-                className="flex w-full items-center justify-center gap-2 rounded-lg bg-[#287eae] px-6 py-3 text-sm font-bold text-white shadow-sm shadow-[#287eae]/20 transition hover:bg-[#206d99] disabled:cursor-not-allowed disabled:bg-slate-300 disabled:shadow-none sm:w-auto"
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-[#008c95] px-6 py-3 text-sm font-bold text-white shadow-sm shadow-[#008c95]/20 transition hover:bg-[#006f78] disabled:cursor-not-allowed disabled:bg-slate-300 disabled:shadow-none sm:w-auto"
               >
                 {isProcessing ? (
                   <>
@@ -772,24 +898,136 @@ function App() {
                   {documents.length} טפסים · {approvedCount} אושרו
                 </p>
               </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-2 text-xs font-semibold text-amber-700">
-                  <AlertCircle size={14} />
-                  כתום = נדרשת בדיקה
-                </span>
-                <button
-                  type="button"
-                  disabled={!approvedCount || isExporting}
-                  onClick={exportApprovedDocuments}
-                  className="flex items-center gap-2 rounded-lg bg-[#287eae] px-4 py-2.5 text-sm font-bold text-white transition hover:bg-[#206d99] disabled:cursor-not-allowed disabled:bg-slate-300"
-                >
-                  {isExporting ? <LoaderCircle size={16} className="animate-spin" /> : <FileSpreadsheet size={16} />}
-                  {isExporting ? 'מייצא...' : `ייצוא ${approvedCount ? `${approvedCount} לאקסל` : 'לאקסל'}`}
-                </button>
-              </div>
+              {approvedCount > 0 && (
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="text-xs text-slate-500">הייצוא כולל רק טפסים שאושרו ({approvedCount})</span>
+                  <button
+                    type="button"
+                    disabled={isExporting}
+                    onClick={exportApprovedDocuments}
+                    className="flex items-center gap-2 rounded-lg bg-[#008c95] px-4 py-2.5 text-sm font-bold text-white shadow-sm transition hover:bg-[#006f78] disabled:cursor-wait disabled:opacity-60"
+                  >
+                    {isExporting ? <LoaderCircle size={16} className="animate-spin" /> : <FileSpreadsheet size={16} />}
+                    {isExporting ? 'מייצא...' : `ייצוא ${approvedCount} טפסים שאושרו`}
+                  </button>
+                </div>
+              )}
             </div>
 
-            <div className="overflow-x-auto">
+            <div className="grid gap-4 bg-slate-50/60 p-4 sm:grid-cols-2 sm:p-6 xl:grid-cols-3">
+              {documents.map((document, index) => {
+                const needsReview = RESULT_FIELDS.filter(
+                  (field) => document.uncertain[field.key] && !document.reviewed[field.key],
+                )
+                const found = RESULT_FIELDS.filter((field) => document.values[field.key]).length
+                const status = document.status === 'processing'
+                  ? ['בעיבוד', 'border-teal-200 bg-teal-50 text-teal-800']
+                  : document.status === 'error'
+                    ? ['נדרש ניסיון נוסף', 'border-rose-200 bg-rose-50 text-rose-700']
+                    : document.approved
+                      ? ['אושר', 'border-emerald-200 bg-emerald-50 text-emerald-700']
+                      : document.status === 'pending'
+                        ? ['ממתין לחילוץ', 'border-slate-200 bg-white text-slate-500']
+                        : needsReview.length
+                          ? ['נדרשת בדיקה', 'border-amber-200 bg-amber-50 text-amber-800']
+                          : ['מוכן לאישור', 'border-teal-200 bg-teal-50 text-teal-800']
+                const visibleFields = RESULT_FIELDS.filter(
+                  (field) => document.values[field.key] || document.uncertain[field.key],
+                )
+                return (
+                  <article key={document.id} className="group overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm transition hover:-translate-y-0.5 hover:border-teal-200 hover:shadow-card">
+                    <button
+                      type="button"
+                      disabled={document.status !== 'complete'}
+                      onClick={() => openPreview(document)}
+                      aria-label={`פתיחת פרטי ${document.file.name}`}
+                      className="block w-full p-5 text-right disabled:cursor-default"
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex min-w-0 items-center gap-3">
+                          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
+                            {document.file.type === 'application/pdf' ? <FileText size={20} /> : <FileImage size={20} />}
+                          </span>
+                          <span className="min-w-0">
+                            <span className="block truncate text-sm font-bold text-slate-800" title={document.file.name}>{document.file.name}</span>
+                            <span className="mt-1 block text-xs text-slate-400">
+                              קובץ {index + 1}{document.page ? ` · עמוד ${document.page}` : ''}
+                              {document.file.size ? ` · ${formatFileSize(document.file.size)}` : ''}
+                            </span>
+                          </span>
+                        </div>
+                        <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${status[1]}`}>
+                          {document.status === 'processing' && <LoaderCircle size={12} className="ml-1 inline animate-spin" />}
+                          {status[0]}
+                        </span>
+                      </div>
+                      {document.status === 'complete' ? (
+                        <>
+                          <div className="mt-5 flex items-center justify-between text-xs">
+                            <span className="font-semibold text-slate-600">מצב השדות</span>
+                            <span className="text-slate-500">{found} מתוך {RESULT_FIELDS.length} זוהו</span>
+                          </div>
+                          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-slate-100">
+                            <div className={`h-full rounded-full ${needsReview.length ? 'bg-amber-400' : 'bg-emerald-500'}`} style={{ width: `${(found / RESULT_FIELDS.length) * 100}%` }} />
+                          </div>
+                          <div className="mt-4 flex items-center gap-2 text-xs">
+                            {needsReview.length ? (
+                              <span className="flex items-center gap-1.5 font-semibold text-amber-800"><AlertCircle size={14} /> {needsReview.length} שדות דורשים בדיקה</span>
+                            ) : (
+                              <span className="flex items-center gap-1.5 font-semibold text-emerald-700"><CheckCircle2 size={14} /> אין שדות הממתינים לבדיקה</span>
+                            )}
+                          </div>
+                          <div className="mt-4 space-y-2 border-t border-slate-100 pt-3">
+                            {visibleFields.slice(0, 3).map((field) => {
+                              const review = document.uncertain[field.key] && !document.reviewed[field.key]
+                              return (
+                                <div key={field.key} className="flex items-center justify-between gap-3 text-xs">
+                                  <span className="shrink-0 text-slate-400">{field.label}</span>
+                                  <span className={`truncate rounded-md px-2 py-1 ${review ? 'bg-amber-50 font-semibold text-amber-800' : document.values[field.key] ? 'text-slate-700' : 'text-slate-400'}`}>
+                                    {document.values[field.key] || 'לא זוהה'}{review ? ' · לבדיקה' : ''}
+                                  </span>
+                                </div>
+                              )
+                            })}
+                            {visibleFields.length > 3 && <span className="block pt-1 text-[11px] text-teal-800">ועוד שדות — לחצו לצפייה בפרטים</span>}
+                          </div>
+                          <span className="mt-5 flex items-center justify-center gap-2 rounded-lg bg-teal-50 px-3 py-2.5 text-sm font-bold text-teal-800 transition group-hover:bg-teal-100">
+                            <Eye size={16} /> פתיחת הפרטים לבדיקה
+                          </span>
+                        </>
+                      ) : (
+                        <div className="mt-5 rounded-lg bg-slate-50 px-3 py-3 text-xs leading-5 text-slate-500">
+                          {document.status === 'processing' && 'המסמך בעיבוד. התוצאות יופיעו כאן בסיום.'}
+                          {document.status === 'pending' && `מוכן לעיבוד${document.file.size ? ` · ${formatFileSize(document.file.size)}` : ''}`}
+                          {document.status === 'error' && (document.error || 'החילוץ לא הצליח. אפשר לנסות שוב.')}
+                        </div>
+                      )}
+                    </button>
+                    <div className="flex items-center justify-between border-t border-slate-100 px-4 py-2.5">
+                      <span className="text-[11px] text-slate-400">
+                        {document.approved ? 'נכלל בייצוא המאושרים' : document.status === 'complete' ? 'אישור נדרש לפני ייצוא' : ' '}
+                      </span>
+                      <div className="flex items-center gap-1">
+                        {document.status === 'error' && (
+                          <button type="button" onClick={extractDocuments} className="flex items-center gap-1 rounded-md px-2 py-1.5 text-xs font-semibold text-teal-800 hover:bg-teal-50">
+                            <RotateCcw size={13} /> נסו שוב
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => removeDocument(document.id)}
+                          aria-label={`הסרת ${document.file.name}`}
+                          className="rounded-md p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                        >
+                          <X size={15} />
+                        </button>
+                      </div>
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+            <div hidden aria-hidden="true">
               <table className="w-full min-w-[1450px] border-collapse text-right text-sm">
                 <thead className="bg-slate-50 text-xs font-semibold text-slate-500">
                   <tr>
@@ -810,8 +1048,8 @@ function App() {
                         <td className="sticky right-0 z-[1] max-w-[220px] bg-white px-4 py-4 hover:bg-slate-50">
                           <div className="flex items-start gap-2">
                             {document.file.type === 'application/pdf'
-                              ? <FileText size={16} className="mt-0.5 shrink-0 text-[#4d94bc]" />
-                              : <FileImage size={16} className="mt-0.5 shrink-0 text-[#4d94bc]" />}
+                              ? <FileText size={16} className="mt-0.5 shrink-0 text-[#008c95]" />
+                              : <FileImage size={16} className="mt-0.5 shrink-0 text-[#008c95]" />}
                             <div className="min-w-0">
                               <span className="block text-xs text-slate-400">טופס {index + 1}</span>
                               <span className="mt-1 block truncate font-semibold text-slate-700" title={document.file.name}>
@@ -837,7 +1075,7 @@ function App() {
                           )
                         })}
                         <td className="whitespace-nowrap px-4 py-4">
-                          {document.status === 'processing' && <span className="flex items-center gap-1.5 text-xs text-blue-600"><LoaderCircle size={14} className="animate-spin" /> בעיבוד</span>}
+                          {document.status === 'processing' && <span className="flex items-center gap-1.5 text-xs text-teal-700"><LoaderCircle size={14} className="animate-spin" /> בעיבוד</span>}
                           {document.status === 'pending' && <span className="text-xs text-slate-400">ממתין לחילוץ</span>}
                           {document.status === 'error' && <span className="text-xs text-rose-600" title={document.error}>החילוץ נכשל</span>}
                           {document.status === 'complete' && document.approved && <span className="flex items-center gap-1 text-xs font-semibold text-emerald-700"><CheckCircle2 size={14} /> אושר</span>}
@@ -853,7 +1091,7 @@ function App() {
                               <button
                                 type="button"
                                 onClick={() => openPreview(document)}
-                                className="flex items-center gap-1 rounded-md px-2.5 py-2 text-xs font-semibold text-[#397b9e] hover:bg-[#eff7fb]"
+                                className="flex items-center gap-1 rounded-md px-2.5 py-2 text-xs font-semibold text-[#007c86] hover:bg-[#edf6f5]"
                               >
                                 <Eye size={14} /> צפייה ועריכה
                               </button>
@@ -870,7 +1108,7 @@ function App() {
                               </button>
                             )}
                             {document.status === 'error' && (
-                              <button type="button" onClick={extractDocuments} className="rounded-md px-2.5 py-2 text-xs font-semibold text-[#397b9e] hover:bg-[#eff7fb]">
+                              <button type="button" onClick={extractDocuments} className="rounded-md px-2.5 py-2 text-xs font-semibold text-[#007c86] hover:bg-[#edf6f5]">
                                 <RotateCcw size={14} />
                               </button>
                             )}
@@ -914,7 +1152,7 @@ function App() {
                   }}
                   placeholder="חיפוש בשם, ת.ז. או מספר"
                   aria-label="חיפוש ברשומות השמורות"
-                  className="w-60 rounded-lg border border-slate-200 py-2.5 pr-9 pl-3 text-sm outline-none focus:border-[#6ba4c2] focus:ring-2 focus:ring-[#e8f4fa]"
+                  className="w-60 rounded-lg border border-slate-200 py-2.5 pr-9 pl-3 text-sm outline-none focus:border-[#008c95] focus:ring-2 focus:ring-[#e4f3f2]"
                 />
               </label>
               <select
@@ -924,27 +1162,82 @@ function App() {
                   setRecordsApproved(event.target.value)
                 }}
                 aria-label="סינון לפי אישור"
-                className="rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-600 outline-none focus:border-[#6ba4c2]"
+                className="rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm text-slate-600 outline-none focus:border-[#008c95]"
               >
                 <option value="">כל סטטוסי האישור</option>
                 <option value="true">אושרו</option>
                 <option value="false">ממתינים לאישור</option>
               </select>
-              <button
-                type="button"
-                disabled={!records.some((record) => record.approved) || isExporting}
-                onClick={exportSavedRecords}
-                className="flex items-center gap-2 rounded-lg bg-[#287eae] px-3 py-2.5 text-sm font-bold text-white disabled:cursor-not-allowed disabled:bg-slate-300"
-              >
-                <FileSpreadsheet size={15} />
-                ייצוא מאושרים
-              </button>
+              {recordsApproved === 'true' && recordsTotal > 0 && (
+                <button
+                  type="button"
+                  disabled={isExporting}
+                  onClick={exportSavedRecords}
+                  className="flex items-center gap-2 rounded-lg bg-[#008c95] px-3 py-2.5 text-sm font-bold text-white transition hover:bg-[#006f78] disabled:cursor-wait disabled:opacity-60"
+                >
+                  {isExporting ? <LoaderCircle size={15} className="animate-spin" /> : <FileSpreadsheet size={15} />}
+                  {isExporting ? 'מייצא...' : 'ייצוא כל המאושרים'}
+                </button>
+              )}
             </div>
           </div>
           {recordsError && (
             <p role="alert" className="px-5 py-3 text-sm text-rose-700 sm:px-7">{recordsError}</p>
           )}
-          <div className="overflow-x-auto">
+          {recordsLoading && <p className="px-5 py-8 text-center text-sm text-slate-500">טוען רשומות…</p>}
+          {!recordsLoading && !recordsError && records.length === 0 && (
+            <p className="px-5 py-10 text-center text-sm text-slate-500">לא נמצאו רשומות מתאימות.</p>
+          )}
+          <div className="grid gap-4 bg-slate-50/60 p-4 sm:grid-cols-2 sm:p-6 xl:grid-cols-3">
+            {records.map((record) => {
+              const values = Object.fromEntries((record.fields || []).map((field) => [field.name, field.value]))
+              const needsReview = (record.fields || []).filter((field) => field.needs_review).length
+              const visibleFields = RESULT_FIELDS.filter((field) => getFieldValue(values[field.aliases[0]]))
+              return (
+                <button
+                  type="button"
+                  key={record.id}
+                  onClick={() => openSavedRecord(record)}
+                  className="group rounded-2xl border border-slate-200 bg-white p-5 text-right shadow-sm transition hover:-translate-y-0.5 hover:border-teal-200 hover:shadow-card"
+                >
+                  <span className="flex items-start justify-between gap-3">
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-bold text-slate-800" title={record.filename}>{record.filename}</span>
+                      <span className="mt-1 block text-xs text-slate-400">{record.form_type || 'סוג טופס לא ידוע'} · עמוד {record.page}</span>
+                    </span>
+                    <span className={`shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
+                      record.approved
+                        ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                        : needsReview
+                          ? 'border-amber-200 bg-amber-50 text-amber-800'
+                          : 'border-teal-200 bg-teal-50 text-teal-800'
+                    }`}>
+                      {record.approved ? 'אושר' : needsReview ? `${needsReview} לבדיקה` : 'ממתין לאישור'}
+                    </span>
+                  </span>
+                  <span className="mt-4 block space-y-2 border-t border-slate-100 pt-3">
+                    {visibleFields.slice(0, 3).map((field) => {
+                      const item = (record.fields || []).find((candidate) => candidate.name === field.aliases[0])
+                      return (
+                        <span key={field.key} className="flex items-center justify-between gap-3 text-xs">
+                          <span className="shrink-0 text-slate-400">{field.label}</span>
+                          <span className={`truncate rounded-md px-2 py-1 ${item?.needs_review ? 'bg-amber-50 font-semibold text-amber-800' : 'text-slate-700'}`}>
+                            {getFieldValue(values[field.aliases[0]])}
+                          </span>
+                        </span>
+                      )
+                    })}
+                    {visibleFields.length > 3 && <span className="block pt-1 text-[11px] text-teal-800">ועוד שדות — לחצו לצפייה בפרטים</span>}
+                  </span>
+                  <span className="mt-4 flex items-center justify-between border-t border-slate-100 pt-3 text-[11px] text-slate-400">
+                    <span>{record.created_at ? new Date(record.created_at).toLocaleDateString('he-IL') : ''}</span>
+                    <span className="font-semibold text-teal-800 group-hover:text-teal-950">פתיחת פרטים לבדיקה ←</span>
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+          <div hidden aria-hidden="true">
             <table className="w-full min-w-[1200px] border-collapse text-right text-sm">
               <thead className="bg-slate-50 text-xs font-semibold text-slate-500">
                 <tr>
@@ -963,7 +1256,7 @@ function App() {
                         <button
                           type="button"
                           onClick={() => openSavedRecord(record)}
-                          className="block max-w-full truncate text-right font-semibold text-blue-700 hover:underline"
+                          className="block max-w-full truncate text-right font-semibold text-teal-800 hover:underline"
                           title={`פתיחת ${record.filename}`}
                         >
                           {record.filename}
@@ -1026,7 +1319,7 @@ function App() {
         </section>
 
         <footer className="mx-auto mt-8 flex max-w-4xl items-center justify-center gap-2 text-xs text-slate-400">
-          <ShieldCheck size={15} className="text-[#70a28b]" />
+          <ShieldCheck size={15} className="text-[#008c95]" />
           המידע מוצג למטרת עיבוד המסמך בלבד
         </footer>
       </main>

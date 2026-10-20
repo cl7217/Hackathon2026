@@ -18,6 +18,7 @@ HEADERS = (
     ("document_date", "תאריך קבלת הדגימה"),
     ("sender", "גורם שולח"),
     ("commitment_number", "מספר התחייבות"),
+    ("received_stamp", "חותמת התקבל"),
 )
 
 
@@ -38,12 +39,21 @@ def build_approved_workbook(document_ids: list[str] | None = None) -> BytesIO:
         cell.fill = PatternFill("solid", fgColor="287EAE")
         cell.alignment = Alignment(horizontal="right")
     for row in rows:
-        values = []
-        for key, _ in HEADERS:
-            value = row.get(key, "")
-            cell_value = ", ".join(map(str, value)) if isinstance(value, list) else value
-            values.append(_safe_cell(cell_value))
-        worksheet.append(values)
+        commitments = row.get("commitment_number")
+        row_commitments = (
+            commitments
+            if isinstance(commitments, list) and commitments
+            else [commitments]
+        )
+        for commitment in row_commitments:
+            values = []
+            for key, _ in HEADERS:
+                value = commitment if key == "commitment_number" else row.get(key, "")
+                cell_value = (
+                    ", ".join(map(str, value)) if isinstance(value, list) else value
+                )
+                values.append(_safe_cell(cell_value))
+            worksheet.append(values)
     for column in worksheet.columns:
         width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 36)
         worksheet.column_dimensions[column[0].column_letter].width = width

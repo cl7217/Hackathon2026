@@ -23,7 +23,7 @@ export default function LivePipelineStepper({ activeStage }) {
               complete
                 ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
                 : active
-                  ? 'border-blue-200 bg-blue-50 font-semibold text-blue-800'
+                  ? 'border-teal-200 bg-teal-50 font-semibold text-teal-800'
                   : 'border-slate-200 bg-white text-slate-400'
             }`}
           >

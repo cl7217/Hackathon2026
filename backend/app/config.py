@@ -26,9 +26,14 @@ FIELD_NAMES = (
     "received_stamp",
 )
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5vl:7b")
-OLLAMA_TIMEOUT_SECONDS = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180"))
+EXTRACTION_MODE = os.getenv(
+    "EXTRACTION_MODE",
+    "local_ocr_rules",
+).strip().casefold()
+if EXTRACTION_MODE not in {"local_ocr_rules", "gemini", "hybrid"}:
+    raise ValueError(
+        "EXTRACTION_MODE must be local_ocr_rules, gemini, or hybrid."
+    )
 TESSERACT_COMMAND = os.getenv("TESSERACT_COMMAND", "tesseract")
 OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "heb+eng")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
@@ -40,24 +45,50 @@ SENDER_ALLOWLIST = (
     "מכבי",
     "מאוחדת",
     "לאומית",
-    "בית חולים",
-    "הדסה",
-    "שיבא",
-    "איכילוב",
-    "רמב״ם",
-    "רמבם",
-    "סורוקה",
-    "בילינסון",
-    "שערי צדק",
-    "וולפסון",
-    "קפלן",
-    "אסף הרופא",
+    "יוספטל",
     "ברזילי",
-    "הלל יפה",
-    "זיו",
-    "פוריה",
-    "לניאדו",
+    "אסף הרופא",
+    "סורוקה",
+    "אסותא באר שבע",
     "מעייני הישועה",
+    "מ.ר.ב מרכז רפואי",
+    "מרכז רפואי הרצליה",
+    "הלל יפה",
+    "וולפסון",
+    "רמב״ם",
+    "בני ציון",
+    "הכרמל",
+    "האיטלקי",
+    "אלישע",
+    "מרכז רפואי חורב",
+    "אסותא חיפה",
+    "פוריה",
+    "הדסה עין כרם",
+    "הדסה הר הצופים",
+    "שערי צדק",
+    "אל מקאסד",
+    " ויקטוריה",
+    "שערי צדק - ביקור חולים",
+    "הסהר האדום",
+    "בי״ח אלקודס ליולדות",
+    "מאיר",
+    "סנט ג'וזף",
+    "נהריה",
+    "הסקוטי",
+    "סנט וינסנט",
+    "המשפחה הקדושה",
+    "לניאדו",
+    "המרכזי בעמק",
+    "רבין ק.בלינסון",
+    "השרון - ק. גולדה",
+    "זיו צפת",
+    "אסותא ראשון לציון",
+    "קפלן",
+    "שיבא",
+    "סנט ג'והן",
+    "אסותא רמת החייל",
+    "סוראסקי",
+    "מרכז שניידר לילדים",
 )
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")

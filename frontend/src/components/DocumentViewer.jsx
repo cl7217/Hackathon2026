@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 
+const API_BASE_URL = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8001').replace(/\/$/, '')
+
 async function createCrop(source, bbox, naturalWidth, naturalHeight) {
   if (!bbox || bbox.length !== 4 || !naturalWidth || !naturalHeight) return ''
   const [left, top, right, bottom] = bbox.map(Number)
@@ -47,7 +49,7 @@ export default function DocumentViewer({
     setNaturalSize({ width: 0, height: 0 })
     if (!documentId) return undefined
     const controller = new AbortController()
-    fetch(`${import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000'}/api/documents/${encodeURIComponent(documentId)}/pages/${page || 1}/image`, {
+    fetch(`${API_BASE_URL}/api/documents/${encodeURIComponent(documentId)}/pages/${page || 1}/image`, {
       signal: controller.signal,
     }).then((response) => {
       if (!response.ok) return ''
@@ -118,8 +120,8 @@ export default function DocumentViewer({
                         y={y}
                         width={right - x}
                         height={bottom - y}
-                        fill={selected ? 'rgba(249, 115, 22, 0.18)' : 'rgba(37, 99, 235, 0.08)'}
-                        stroke={selected ? '#ea580c' : '#2563eb'}
+                        fill={selected ? 'rgba(0, 140, 149, 0.18)' : 'rgba(0, 124, 134, 0.08)'}
+                        stroke={selected ? '#008c95' : '#007c86'}
                         strokeWidth={selected ? 5 : 3}
                       />
                     </g>
@@ -141,8 +143,8 @@ export default function DocumentViewer({
         <p className="text-sm text-slate-500">תצוגת המסמך אינה זמינה. ניתן לפתוח שוב את הקובץ לאחר עיבוד.</p>
       )}
       {selectedMeta?.handwritten && cropUrl && (
-        <figure className="w-full rounded-lg border border-amber-200 bg-white p-2">
-          <figcaption className="mb-1 text-xs font-semibold text-amber-800">חיתוך מוגדל · {selectedField}</figcaption>
+        <figure className="w-full rounded-lg border border-teal-200 bg-white p-2">
+          <figcaption className="mb-1 text-xs font-semibold text-teal-800">חיתוך מוגדל · {selectedField}</figcaption>
           <img src={cropUrl} alt={`הגדלה של ${selectedField}`} className="mx-auto max-h-36 max-w-full object-contain" />
         </figure>
       )}

@@ -24,7 +24,9 @@ class DocumentApiTests(unittest.TestCase):
         self.assertIn("/api/documents/batch/{batch_id}", paths)
         self.assertIn("/api/documents/{document_id}/fields", paths)
         self.assertIn("/api/documents/{document_id}/pages/{page}/image", paths)
+        self.assertIn("/api/logs", paths)
         self.assertIn("post", paths["/api/documents/upload"])
+        self.assertIn("get", paths["/api/logs"])
         self.assertIn("patch", paths["/api/documents/{document_id}/fields"])
 
 

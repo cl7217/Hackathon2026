@@ -6,8 +6,8 @@
 
 :root {
   font-family: 'Heebo', Arial, sans-serif;
-  color: #152b45;
-  background: #f6f9fc;
+  color: #173a4a;
+  background: #f4f8f8;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -31,6 +31,6 @@ input {
 }
 
 ::selection {
-  color: #124d78;
-  background: #d8efff;
+  color: #006f78;
+  background: #d9efed;
 }

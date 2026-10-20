@@ -1,72 +1,106 @@
-# Backend - חילוץ טפסי התחייבות
+# הוראות הפעלה — מערכת חילוץ טפסי התחייבות
 
-ה־API מקבל PDF ותמונות, מעבד כל עמוד בנפרד, מסווג ומחלץ שדות בעזרת Tesseract ו־Ollama מקומיים, ומסמן לבדיקה שדות חסרים או לא ודאיים. כברירת מחדל הנתונים נשמרים ב־SQLite מקומי. ניתן להפעיל Supabase לשמירה קבועה, חיפוש וסינון של רשומות. קובצי המקור נשמרים זמנית בתור המקומי בלבד ואינם מועלים ל־Supabase.
+ההוראות מיועדות ל-Windows ול-PowerShell. להרצת המערכת המקומית לא צריך חשבון Supabase או חיבור למודל חיצוני.
 
-## התקנה והפעלה
+## דרישות מקדימות
+
+- Python 3.11 ומעלה
+- Node.js ו-npm
+- Tesseract OCR עם חבילות השפה `heb` ו-`eng`
+
+בדקו ש-Python ו-Node.js זמינים:
 
 ```powershell
+python --version
+node --version
+npm --version
+tesseract --version
+```
+
+אם `tesseract` לא מזוהה, התקינו אותו והוסיפו אותו ל-`PATH`. ודאו שחבילות `heb` ו-`eng` מותקנות. אם הפקודה מותקנת בשם או במיקום אחר, הגדירו `TESSERACT_COMMAND` בקובץ `backend\.env`.
+
+## התקנה והפעלת ה-backend
+
+פתחו חלון PowerShell בתיקיית הפרויקט:
+
+```powershell
+cd D:\Hackathon2026\backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8001
 ```
 
-להתקנת מודל מקומי נדרשים Ollama ומודל vision מתאים. ברירת המחדל היא `qwen2.5vl:7b`:
+אם PowerShell חוסם הפעלת סקריפטים, אפשר לדלג על הפעלת הסביבה ולהריץ את `python` ואת `uvicorn` ישירות דרך `.\.venv\Scripts\python.exe` ו-`.\.venv\Scripts\uvicorn.exe`.
+
+כתובת ה-API היא `http://127.0.0.1:8001`. תיעוד ה-API האינטראקטיבי זמין בכתובת `http://127.0.0.1:8001/docs`.
+
+## התקנה והפעלת ה-frontend
+
+פתחו חלון PowerShell שני:
 
 ```powershell
-ollama pull qwen2.5vl:7b
+cd D:\Hackathon2026\frontend
+npm install
+npm run dev -- --host 127.0.0.1 --port 5173
 ```
 
-להפעלת OCR מקומי להתאמה מול המודל יש להתקין Tesseract עם נתוני השפה `heb` ו־`eng`. ה־OCR המקומי קורא את העמוד ואת אזורי השדות המודפסים; אזור שמזוהה ככתב יד או לא תואם ל־OCR נחתך ונשלח ל־Ollama המקומי. אם Tesseract אינו זמין, החילוץ המקומי עדיין יכול לפעול, אך שדות לא יקבלו אישור אוטומטי ויישארו לבדיקה.
+פתחו בדפדפן את `http://127.0.0.1:5173`. ה-frontend פונה כברירת מחדל ל-backend ב-`http://127.0.0.1:8001`.
+
+אם ה-backend פועל בכתובת אחרת, צרו `frontend\.env.local` והגדירו למשל:
+
+```dotenv
+VITE_API_URL=http://127.0.0.1:8001
+```
+
+לאחר שינוי משתני frontend יש להפעיל מחדש את שרת Vite.
+
+## הגדרות ואחסון
+
+ברירת המחדל ב-`backend\.env.example` היא:
+
+```dotenv
+EXTRACTION_MODE=local_ocr_rules
+OCR_LANGUAGES=heb+eng
+```
+
+העתיקו את הקובץ ל-`backend\.env` לפני הפעלה. במצב ברירת המחדל, החילוץ מתבצע באמצעות Tesseract וכללים מקומיים ואינו מתחבר ל-Gemini או למודל חיצוני. אין צורך להגדיר מפתח Gemini.
+
+ללא פרטי Supabase, הנתונים נשמרים ב-SQLite בתיקיית `backend\data`; תמונות התצוגה נשמרות בזיכרון בלבד. כדי לשנות את מיקום נתוני SQLite והיומן, אפשר להגדיר ב-`backend\.env`:
+
+```dotenv
+EXTRACTION_DATA_DIR=D:\MedicalExtractionData
+```
+
+### Supabase (אופציונלי)
+
+1. צרו פרויקט Supabase.
+2. הריצו את קובץ המיגרציה `backend\supabase\migrations\20261018000000_create_extraction_schema.sql` ב-SQL Editor של הפרויקט.
+3. הגדירו ב-`backend\.env` את `SUPABASE_URL` ואת `SUPABASE_SERVICE_ROLE_KEY`.
+4. הפעילו מחדש את ה-backend.
+
+מפתח `service_role` הוא סודי: שומרים אותו רק ב-`backend\.env`, ולא בקובצי frontend, ב-Git או בהודעות. אין להשתמש במערכת עם מידע רפואי אמיתי לפני הוספת אימות והרשאות מתאימות.
+
+## הרצה ובדיקות
+
+בדיקות backend — מתוך `backend` כשהסביבה הווירטואלית פעילה:
 
 ```powershell
-uvicorn app.main:app --reload
+python -m compileall -q app tests
+python -m unittest discover -s tests
 ```
 
-## הגדרות
+בדיקת בניית frontend — מתוך `frontend`:
 
-| משתנה | ברירת מחדל | תפקיד |
-|---|---|---|
-| `OLLAMA_URL` | `http://127.0.0.1:11434` | כתובת שירות Ollama מקומי |
-| `OLLAMA_MODEL` | `qwen2.5vl:7b` | מודל ראייה־שפה מקומי; יש לבחור מודל שנבדק לעברית ולכתב־יד |
-| `OLLAMA_TIMEOUT_SECONDS` | `180` | זמן המתנה למודל |
-| `TESSERACT_COMMAND` | `tesseract` | נתיב לפקודת Tesseract המקומית |
-| `OCR_LANGUAGES` | `heb+eng` | שפות OCR מקומיות |
-| `EXTRACTION_DATA_DIR` | `backend/data` | תיקיית SQLite וקובצי תור זמניים |
+```powershell
+npm run build
+```
 
-אפשר להעתיק את `.env.example` ל־`.env` ולשנות הגדרות מקומיות.
+## העלאה, יומן וייצוא
 
-## הפעלת Supabase
-
-1. צרו פרויקט Supabase והעתיקו את כתובת הפרויקט ואת ה־`service_role` key מהגדרות ה־API.
-2. הריצו את ה־migration שב־`supabase/migrations/20261018000000_create_extraction_schema.sql` דרך Supabase CLI או SQL Editor.
-3. הגדירו ב־`backend/.env` את `SUPABASE_URL` ואת `SUPABASE_SERVICE_ROLE_KEY`. נדרשים שני הערכים; אם הוגדר רק אחד, השרת יפסיק בשגיאה מפורשת.
-4. הפעילו מחדש את ה־backend. בבדיקת העלייה הוא יוודא שהטבלאות נגישות.
-
-ה־migration יוצר טבלאות נפרדות לאצוות, מסמכים, טפסים ושדות; כל שדה נשמר כרשומה עם הערך, הביטחון, מקור החילוץ, האזור בתמונה ומצב הבדיקה שלו. מפתח `service_role` מעניק גישה מלאה: שמרו אותו ב־backend בלבד, אל תוסיפו אותו ל־frontend או ל־Git, והגבילו גישה ל־API של ה־backend לרשת מהימנה. ה־migration מפעיל RLS ושולל גישה מ־`anon` ומ־`authenticated`; ה־backend משתמש במפתח השירות כדי לבצע פעולות. קובצי המקור לא נשמרים ב־Supabase, אבל תוצאות OCR וחילוץ כוללות מידע רפואי רגיש ונשמרות בו. אין להשתמש בנתוני אמת לפני הוספת אימות והרשאות משתמשים, הגדרת מדיניות שמירה ומחיקה, ובדיקת דרישות הפרטיות והאבטחה של הארגון.
-
-בהיעדר הגדרות Supabase, SQLite נשאר backend ברירת המחדל לפיתוח מקומי. שינוי backend אינו מעביר רשומות קיימות בין SQLite ל־Supabase.
-
-## API
-
-- `POST /extract` או `POST /api/extract/` — חילוץ סינכרוני של קובץ יחיד, לשמירת תאימות לממשק הקיים.
-- `POST /api/documents/upload` (וגם `POST /api/batches`) — קליטת כמה קבצים והכנסתם לעיבוד רקע; עד 50 קבצים, 20MB לקובץ ו־100MB לאצווה.
-- `GET /api/documents/batch/{batch_id}` (וגם `GET /api/batches/{batch_id}`) — מצב האצווה ושלב הצינור הנוכחי, המסמכים, הטפסים והשדות.
-- `GET /api/documents/{document_id}/pages/{page}/image` — תמונת PNG זמנית לצפייה וסימון תיבות מיקום; התמונות נשמרות בזיכרון בלבד, במטמון מוגבל, ואינן נשמרות ב־SQLite או ב־Supabase.
-- `GET /api/records?search=<text>&status=<status>&approved=<true|false>&sender=<text>&limit=50&offset=0` — חיפוש וסינון רשומות שמורות, כולל ספירת תוצאות לדפדוף.
-- `PATCH /api/documents/{document_id}/fields` — תיקון כמה שדות בעדכון אחד (`{"page":1,"fields":{"first_name":"דנה"}}`); יש גם endpoint תואם לעדכון שדה יחיד.
-- `PATCH /api/documents/{document_id}/fields/{field_name}?page=1` — שמירת תיקון משתמש.
-- `POST /api/documents/{document_id}/fields/{field_name}/review?page=1` — סימון שדה כבדוק, גם אם הוא נשאר ריק.
-- `POST /api/documents/{document_id}/approve?page=1` — אישור עמוד רק לאחר בדיקת כל השדות שבו.
-- `DELETE /api/documents/{document_id}?page=1` — מחיקת עמוד ותוצריו.
-- `GET /api/export.xlsx?document_ids=<id>` — ייצוא עמודים שאושרו מהמסמכים שצוינו ל־XLSX.
-
-בכל שדה נשמרים הערך, הטקסט המקורי שנקרא, מספר העמוד, תיבת המיקום בפיקסלים, מקור החילוץ, סוג הכתב, אותות האימות ומצב `green`/`orange`/`empty`. מספרים מרכזיים ומספרי התחייבות נשמרים כרשימות; הממשק מציג אותם מופרדים בפסיקים.
-
-## פרטיות ומגבלות
-
-- התמונות וקובצי המקור נשמרים בתיקיית תור מקומית רק עד לסיום העבודה ונמחקים אחריה. התור הוא מקומי לתהליך ואינו תחליף ל־broker עמיד במקרה של כיבוי/אתחול מחדש. הטקסט המחולץ, לרבות מידע רפואי מזהה, נשמר ב־SQLite או ב־Supabase בהתאם לתצורה. יש להגן על `EXTRACTION_DATA_DIR` ועל פרויקט Supabase ולמחוק נתונים לפי מדיניות הארגון.
-- ה־API אינו שולח קבצים לענן. כתובת המודל מוגדרת כברירת מחדל ל־localhost; אין להגדיר אותה לשרת חיצוני עם מידע אמיתי.
-- השימוש ב־VLM וב־Tesseract לעברית ולכתב־יד דורש הערכה על טפסי אמת. המערכת אינה מסמנת שדות כתב־יד כוודאיים אוטומטית.
-- קידומות מספרי התחייבות מאומתות לפי הקופה (כללית `30`, לאומית `12`, מאוחדת `73`, מכבי `26`); התאמה חסרה או שגויה מסומנת לבדיקה. לא הוגדר עדיין פורמט מאומת למספר המרכזי.
-- רשימת המוסדות הסגורה נמצאת ב־`app/config.py` ויש להשלים/לאמת אותה מול מקור רשמי לפני שימוש תפעולי.
-- ה־SQLite אינו מוצפן, וה־API אינו כולל אימות משתמשים. גם Supabase דורש אימות והרשאות ברמת משתמש לפני פריסה תפעולית. יש להגביל את הגישה לרשת פרטית ולהוסיף הגנות מתאימות לפני שימוש במידע רפואי אמיתי.
+- מעלים PDF, PNG או JPG דרך הממשק; ניתן לבחור עד 50 קבצים באצווה. מגבלת קובץ היא 20MB ומגבלת אצווה היא 100MB.
+- מאשרים או מתקנים את הנתונים בממשק לפני ייצוא.
+- יומן האירועים נמצא כברירת מחדל ב-`backend\data\logs\extraction-events.jsonl`.
+- קריאת היומן זמינה ב-`http://127.0.0.1:8001/api/logs`; אפשר לסנן באמצעות `batch_id`, `trace_id` או `document_id`.
+- ייצוא Excel זמין מתוך הממשק לאחר האישור.

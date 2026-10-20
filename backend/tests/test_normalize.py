@@ -6,7 +6,11 @@ from app.pipeline.normalize import (
     normalize_id_number,
     normalize_identifier_list,
 )
-from app.pipeline.confidence import evaluate_field, validate_user_value
+from app.pipeline.confidence import (
+    evaluate_field,
+    sender_is_allowed,
+    validate_user_value,
+)
 
 
 class NormalizeTests(unittest.TestCase):
@@ -57,7 +61,46 @@ class NormalizeTests(unittest.TestCase):
 
     def test_sender_values_must_match_a_closed_allowlist(self):
         self.assertEqual(validate_user_value("sender", "כללית", "clalit")[0], "green")
+        self.assertTrue(sender_is_allowed("שירותי בריאות כללית"))
+        self.assertTrue(sender_is_allowed("המרכז הרפואי שיבא תל השומר"))
+        self.assertEqual(validate_user_value("health_fund", "בית חולים שיבא", "hospital")[0], "orange")
         self.assertEqual(validate_user_value("sender", "ביתר עלית-גבע.א", "clalit")[0], "orange")
+
+    def test_center_and_commitment_numbers_must_be_numeric(self):
+        self.assertEqual(
+            validate_user_value("center_number", ["00123", "456"], "clalit")[0],
+            "green",
+        )
+        self.assertEqual(
+            validate_user_value("center_number", ["00123", "45O"], "clalit")[0],
+            "orange",
+        )
+        self.assertEqual(
+            validate_user_value("commitment_number", ["30-123", "30 456"], "clalit")[0],
+            "green",
+        )
+        self.assertEqual(
+            validate_user_value("commitment_number", ["30O123"], "clalit")[0],
+            "orange",
+        )
+
+    def test_sample_date_and_received_stamp_require_the_correct_context(self):
+        self.assertEqual(
+            validate_user_value("document_date", "20/10/2026", "clalit")[0],
+            "green",
+        )
+        self.assertEqual(
+            validate_user_value("document_date", "31/02/2026", "clalit")[0],
+            "orange",
+        )
+        self.assertEqual(
+            validate_user_value("received_stamp", "התקבל", "clalit")[0],
+            "green",
+        )
+        self.assertEqual(
+            validate_user_value("received_stamp", "נחתם", "clalit")[0],
+            "orange",
+        )
 
 
 if __name__ == "__main__":
